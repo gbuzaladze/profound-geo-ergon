@@ -17,6 +17,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
+from pipeline.config import ASSET_NAME
+
 # Instagram path segments that mean a post, not a profile (from the enricher).
 POST_MARKERS = {"p", "reel", "tv"}
 RESERVED_PATHS = POST_MARKERS | {
@@ -271,7 +273,7 @@ def resolve_youtube_video(url: str) -> str | None:
     oembed_url = YOUTUBE_OEMBED.format(url=quote(url, safe=""))
     request = Request(
         oembed_url,
-        headers={"User-Agent": "Ergon-GEO-citation-author"},
+        headers={"User-Agent": f"{ASSET_NAME}-GEO-citation-author"},
     )
     try:
         with urlopen(request, timeout=_OEMBED_TIMEOUT_SECONDS) as response:

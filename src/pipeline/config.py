@@ -114,7 +114,8 @@ def _as_slug(value: object, key: str) -> str:
 class Country:
     """One Profound category exported into data/{slug}/ and schema {slug}.
 
-    `owned_asset` is the Profound brand name used for dashboard KPIs.
+    `owned_asset` is the Profound brand name used for dashboard KPIs. A
+    country may override the project default when Profound uses a local name.
     """
 
     slug: str
@@ -236,9 +237,9 @@ def is_owned_citation_host(
     """True when hostname or domain is forced to the Owned citation category.
 
     An owned_citation_hosts entry matches the hostname, the registrable domain,
-    or a parent of the hostname (ergon.com matches www.ergon.com).
+    or a parent of the hostname (brand.com matches www.brand.com).
     An owned_citation_contains token matches when it appears anywhere in the
-    hostname or domain, so ergon covers country sites that include that text.
+    hostname or domain, so one token covers country sites that include it.
     """
     host = _host_key(hostname)
     domain_key = _host_key(domain)

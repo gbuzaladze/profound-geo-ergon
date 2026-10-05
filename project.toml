@@ -3,8 +3,8 @@
 #
 # 1. Fill in the values below.
 # 2. Put PROFOUND_API_KEY in .env (see .env.example).
-# 3. Add one [[countries]] table per Profound category. Exports land in
-#    data/{slug}/.
+# 3. Add one [[countries]] table per Profound category. A pull writes
+#    data/{slug}/, then combines scores and citations into data/.
 # 4. Run a full export:  python -m pipeline
 # =============================================================================
 

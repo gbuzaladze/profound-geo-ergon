@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from pipeline.common import write_csv
 from pipeline.config import COUNTRIES, project_root
 
 SCORE_FILE = "fact_scores_summarized.csv"
@@ -28,6 +29,19 @@ DIM_FILES = (
 def combined_dir() -> Path:
     """Return data/, the concatenated export folder."""
     return project_root() / "data"
+
+
+def _publish_csv(temp_path: Path, destination: Path) -> Path:
+    """Replace destination with the temp CSV. If the target is open, keep the temp."""
+    try:
+        temp_path.replace(destination)
+    except PermissionError:
+        print(
+            f"Could not replace {destination} (file is open). "
+            f"Left new export at {temp_path}."
+        )
+        return temp_path
+    return destination
 
 
 def _header(path: Path) -> list[str]:
@@ -62,14 +76,7 @@ def concat_csvs(sources: list[Path], destination: Path) -> int:
                 for row in csv.DictReader(in_file):
                     writer.writerow(row)
                     written += 1
-    try:
-        temp_path.replace(destination)
-    except PermissionError:
-        print(
-            f"Could not replace {destination} (file is open). "
-            f"Left new export at {temp_path}."
-        )
-        return written
+    _publish_csv(temp_path, destination)
     return written
 
 
@@ -95,10 +102,13 @@ def _regions_in(paths: list[Path]) -> set[str]:
     return regions
 
 
-def _write_combined_scores(
+def _write_merged_fact(
     sources: list[Path], destination: Path, replaced_regions: set[str]
 ) -> int:
-    """Write new category rows plus combined rows for regions not refreshed."""
+    """Keep combined rows whose region was not in this pull, then append new rows.
+
+    A blank region is not treated as a refreshed country, so those rows stay.
+    """
     fieldnames = _header(sources[0])
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.with_name(destination.stem + ".tmp.csv")
@@ -119,13 +129,7 @@ def _write_combined_scores(
                 for row in csv.DictReader(in_file):
                     writer.writerow(row)
                     written += 1
-    try:
-        temp_path.replace(destination)
-    except PermissionError:
-        print(
-            f"Could not replace {destination} (file is open). "
-            f"Left new export at {temp_path}."
-        )
+    _publish_csv(temp_path, destination)
     return written
 
 
@@ -145,12 +149,14 @@ def _remove_tree(folder: Path) -> None:
 
 
 def _remove_category_dirs(sources: list[Path]) -> None:
-    """Delete data/{slug}/ after its rows are in the combined file."""
+    """Delete each data/{slug}/ once after its rows are in the combined file."""
     data_root = combined_dir().resolve()
+    seen: set[Path] = set()
     for path in sources:
         folder = path.parent.resolve()
-        if folder == data_root or data_root not in folder.parents:
+        if folder in seen or folder == data_root or data_root not in folder.parents:
             continue
+        seen.add(folder)
         _remove_tree(folder)
         print(f"Removed {folder}")
 
@@ -167,7 +173,7 @@ def _category_sources(filename: str) -> list[Path]:
 def _merge_fact(sources: list[Path], destination: Path, label: str) -> int:
     """Replace combined rows for regions in this pull and keep the other category."""
     replaced_regions = _regions_in(sources)
-    rows = _write_combined_scores(sources, destination, replaced_regions)
+    rows = _write_merged_fact(sources, destination, replaced_regions)
     print(f"Combined {label} written to {destination}: {rows} rows")
     return rows
 
@@ -215,18 +221,4 @@ def concat_csvs_from_rows(
     destination: Path, fieldnames: list[str], rows: list[dict[str, str]]
 ) -> Path:
     """Write a small CSV, replacing the target unless it is open."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(destination.stem + ".tmp.csv")
-    with temp_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    try:
-        temp_path.replace(destination)
-    except PermissionError:
-        print(
-            f"Could not replace {destination} (file is open). "
-            f"Left new export at {temp_path}."
-        )
-        return temp_path
-    return destination
+    return write_csv(rows, path=destination, fieldnames=fieldnames)

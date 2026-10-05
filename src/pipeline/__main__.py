@@ -62,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
         export_scores_summarized()
         export_prompts()
         export_raw_citations(mode=citations_mode, fresh=args.fresh)
+    # Category folders are intermediate. Country stays on the region column.
     combine_category_exports()
 
 

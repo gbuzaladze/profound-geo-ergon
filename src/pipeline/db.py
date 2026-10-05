@@ -113,16 +113,20 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     "dim_region": (("region", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
 }
 
-_PRIMARY_KEYS = {
-    "dim_date": ("date",),
-    "dim_topic": ("topic",),
-    "dim_platform": ("platform",),
-    "dim_region": ("region",),
-    _SCORES_TABLE: ("date", "region", "topic", "platform", "asset"),
+# Text grain columns are matched case-insensitively. date is not folded.
+# Region is the country inside a multi-country Profound category.
+_SCORE_GRAIN = ("date", "region", "topic", "platform", "asset")
+# Slicer dims are dim_{column}, except dim_prompt which is a prompt snapshot.
+_SLICER_DIMENSIONS = {
+    table: table.removeprefix("dim_")
+    for table in TABLES
+    if table.startswith("dim_") and table != "dim_prompt"
 }
+_PRIMARY_KEYS = {table: (column,) for table, column in _SLICER_DIMENSIONS.items()}
+_PRIMARY_KEYS[_SCORES_TABLE] = _SCORE_GRAIN
 _DATE_INDEXED = (_SCORES_TABLE, "fact_raw_citations")
 # Existing databases were created with NVARCHAR(200/2000). Widen to MAX so
-# Mexico citation URLs and long prompt text are not truncated.
+# long citation URLs and prompt text are not truncated.
 _WIDEN_TO_MAX = {
     "fact_raw_citations": (
         ("mentioned", True),
@@ -540,23 +544,23 @@ def row_tuple(
 # share a primary key. Collapse before insert so CSV and SQL stay aligned.
 
 
-def _score_key(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
+def _score_key(row: dict[str, Any]) -> tuple[str, ...]:
     """Case-insensitive scores grain matching Azure SQL CI collation."""
-    return (
-        str(row.get("date") or "").strip(),
-        str(row.get("region") or "").strip().casefold(),
-        str(row.get("topic") or "").strip().casefold(),
-        str(row.get("platform") or "").strip().casefold(),
-        str(row.get("asset") or "").strip().casefold(),
-    )
+    parts: list[str] = []
+    for column in _SCORE_GRAIN:
+        value = str(row.get(column) or "").strip()
+        if column != "date":
+            value = value.casefold()
+        parts.append(value)
+    return tuple(parts)
 
 
 def _asset_name_rank(name: str) -> int:
     """Prefer display casing when two spellings share one CI key.
 
-    Lower is better: Title Case (`Ergon`), then mixed (`Cargill`), then
-    ALL CAPS (`FDA` / `ERGON`), then lowercase. Singleton names are left
-    alone by `_prefer_asset_name` so `FDA` is not rewritten to `Fda`.
+    Lower is better: Title Case, then mixed (`AbbVie`), then ALL CAPS
+    (`FDA`), then lowercase. Singleton names are left alone by
+    `_prefer_asset_name` so `FDA` is not rewritten to `Fda`.
     """
     if not name:
         return 4
@@ -606,7 +610,7 @@ def _merge_score_row(
 
 def dedupe_score_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse case-variant asset names onto one row per scores grain."""
-    merged: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    merged: dict[tuple[str, ...], dict[str, Any]] = {}
     for row in rows:
         key = _score_key(row)
         existing = merged.get(key)
@@ -829,19 +833,13 @@ def read_rows_before(table: str, before_date: str) -> list[dict[str, Any]]:
 def rebuild_dimensions_from_sql() -> None:
     """Replace shared dimensions from distinct keys in both SQL fact tables."""
     schema = active_country().slug
-    dimensions = {
-        "dim_date": "date",
-        "dim_topic": "topic",
-        "dim_platform": "platform",
-        "dim_region": "region",
-    }
     with sql_connection() as conn:
         if conn is None:
             raise RuntimeError("Azure SQL must be configured for cloud execution.")
         cursor = conn.cursor()
         ensure_schema_and_tables(cursor, schema)
         conn.commit()
-        for table, column in dimensions.items():
+        for table, column in _SLICER_DIMENSIONS.items():
             cursor.execute(
                 f"""
                 SELECT [{column}]

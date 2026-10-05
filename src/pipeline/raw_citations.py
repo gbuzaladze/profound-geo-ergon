@@ -819,6 +819,8 @@ def main(argv: list[str] | None = None) -> None:
             continue
         mode = "full" if args.full else ("incremental" if args.incremental else None)
         export(mode=mode, fresh=args.fresh)
+    # Author enrichment rewrites the combined CSV in place. A pull writes
+    # data/{slug}/ first, so those folders are merged only after every category.
     if not args.enrich_authors:
         combine_category_exports()
 
