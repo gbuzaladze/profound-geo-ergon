@@ -29,6 +29,7 @@ from pipeline.common import (
     rate_limiter,
     read_csv,
     ref_name,
+    write_csv,
     write_csv_and_sql,
 )
 from pipeline.combine import combine_category_exports
@@ -602,12 +603,49 @@ def run_full(*, fresh: bool) -> tuple[list[dict[str, object]], int, int, str, st
     return rows, answers_scanned, api_calls, start, scan_end
 
 
+def _restore_category_citations() -> None:
+    """Copy this category's rows out of the combined citation CSV.
+
+    A finished pull merges data/{slug}/ into data/ and deletes the category
+    folder. The next incremental run needs those rows back. Region names are
+    the comma-separated countries on the category.
+    """
+    path = output_path()
+    if path.is_file():
+        return
+    combined = project_root() / "data" / "fact_raw_citations.csv"
+    if not combined.is_file():
+        return
+    regions = {
+        part.strip()
+        for part in active_country().name.split(",")
+        if part.strip()
+    }
+    with combined.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [
+            row
+            for row in reader
+            if (row.get("region") or "").strip() in regions
+        ]
+    if not rows or not fieldnames:
+        return
+    write_csv(rows, path=path, fieldnames=fieldnames)
+    print(
+        f"Restored {len(rows)} citation rows into {path.name} "
+        f"for {active_country().slug}.",
+        flush=True,
+    )
+
+
 def run_incremental() -> tuple[list[dict[str, object]], int, int, str, str]:
     """Replace the last stored date through yesterday; keep older rows.
 
     The last date is re-fetched because that day's Profound answers can still
     change after the previous pull.
     """
+    _restore_category_citations()
     if not output_path().exists():
         raise SystemExit(f"{output_path()} does not exist. Run a --full pull first.")
 
