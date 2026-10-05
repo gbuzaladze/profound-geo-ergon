@@ -4,28 +4,26 @@
 # 1. Fill in the values below.
 # 2. Put PROFOUND_API_KEY in .env (see .env.example).
 # 3. Add one [[countries]] table per Profound category. Exports land in
-#    data/{slug}/ and dashboards in dashboard/{slug}/.
+#    data/{slug}/.
 # 4. Run a full export:  python -m pipeline
 # =============================================================================
 
 [project]
 # Owned brand that must always appear in fact_scores_summarized, even if it
 # ranks outside the top N. Must match the asset name in Profound.
-owned_asset = "Novartis"
+owned_asset = "Ergon"
 
 # Extra Profound asset names that must always appear in fact_scores_summarized,
 # even if they rank outside the top N. Marked is_owned. An alias is exported
-# only when that category tracks the exact name, so it is not zero-filled as a
-# second brand. Do not list Novartis here: Canada uses owned_asset Novartis,
-# and Mexico and Brazil use Novartis - Mexico and Novartis - Brazil.
-owned_aliases = ["Kesimpta", "Kisqali", "Pluvicto", "Leqvio", "Zolgensma", "Fabhalta"]
+# only when that category tracks the exact name.
+owned_aliases = []
 
 # Hostnames or registrable domains whose citation category is forced to Owned.
 # A row matches if hostname or domain equals an entry, or hostname is a
-# subdomain of one (case-insensitive). Use a domain like kisqali.com to
+# subdomain of one (case-insensitive). Use a domain like ergon.com to
 # cover all subdomains; use a full hostname for a specific third-party host.
 # owned_citation_contains matches any hostname or domain that includes the
-# text, so novartis.com.br and novartis.com.mx are Owned without listing
+# text, so a country site that contains ergon is Owned without listing
 # each country code. Product sites that do not contain that text stay in
 # owned_citation_hosts.
 # citation-domains/citation-domains-{slug}.csv overrides category when domain matches, and
@@ -33,51 +31,28 @@ owned_aliases = ["Kesimpta", "Kisqali", "Pluvicto", "Leqvio", "Zolgensma", "Fabh
 # keeps the Profound category, including the Owned overrides above, with
 # subcategory and pag blank. The same file name applies to every country;
 # a missing file leaves that country on the Profound category.
-owned_citation_contains = ["novartis"]
-owned_citation_hosts = [
-  "kisqali.com",
-  "kisqali-hcp.com",
-  "pluvicto.com",
-  "pluvicto-hcp.com",
-  "kesimpta.com",
-  "kesimptahcp.com",
-  "fabhalta.com",
-  "fabhalta-hcp.com",
-  "fabhalta-id.com",
-  "zolgensma.com",
-  "zolgensma-hcp.com",
-  "zolgensma-enrollment.com",
-  "zolgensma-itvisma-copayassist.com",
-  "zolgensmacopayassist.com",
-  "zolgensmareimbursement.com",
-  "myrules.ca",
-  "myrule.com",
-]
+owned_citation_contains = ["ergon"]
+owned_citation_hosts = ["ergon.com"]
 
 # Inclusive first date to pull (YYYY-MM-DD). Both fact tables scan through
-# yesterday; today's date is never requested.
-start_date = "2025-01-01"
+# yesterday; today's date is never requested. Ergon visibility starts in
+# September 2026.
+start_date = "2026-09-01"
 
-# One Profound category per market. slug is the data/ and dashboard/ folder name.
-# owned_asset is the Profound brand name used for dashboard KPIs; it falls
-# back to [project] owned_asset when omitted.
+# One Profound category per entry. Each category covers several countries;
+# the country is the region column on fact_scores_summarized, not the slug.
+# slug is the data/ folder name. owned_asset falls back to [project] owned_asset.
 [[countries]]
-slug = "canada"
-name = "Canada"
-category_id = "7b4d2b6f-e804-4a90-9304-e4bdefebf630"
-owned_asset = "Novartis"
-
-[[countries]]
-slug = "mexico"
-name = "Mexico"
-category_id = "be34adae-1323-41f9-877d-909239648215"
-owned_asset = "Novartis - Mexico"
+slug = "americas-uk-au-uae"
+name = "United States, Mexico, Brazil, United Kingdom, Australia, United Arab Emirates"
+category_id = "6f0ee61a-a04c-4b84-87dc-3d720b93d8c1"
+owned_asset = "Ergon"
 
 [[countries]]
-slug = "brazil"
-name = "Brazil"
-category_id = "5301600f-72e4-4614-bae9-dba34650bba4"
-owned_asset = "Novartis - Brazil"
+slug = "europe-asia"
+name = "Belgium, France, Germany, Spain, Sweden, Indonesia, Singapore, South Korea, Vietnam"
+category_id = "61d4fa1f-7d52-4edc-83d1-e5ae1f3b4265"
+owned_asset = "Ergon"
 
 [ranking]
 # Number of brands kept per metric in each topic. The export unions top_n by

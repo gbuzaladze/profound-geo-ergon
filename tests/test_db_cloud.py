@@ -62,7 +62,7 @@ class AtomicReplacementTests(unittest.TestCase):
         copied = _replace_with_rows(
             cursor,
             connection,
-            schema="canada",
+            schema="europe-asia",
             table="dim_date",
             fieldnames=["date", "load_date"],
             rows=[("2026-09-14", "2026-09-15")],
@@ -72,7 +72,7 @@ class AtomicReplacementTests(unittest.TestCase):
         truncate_index = next(
             index
             for index, event in enumerate(cursor.events)
-            if event == "TRUNCATE TABLE [canada].[dim_date]"
+            if event == "TRUNCATE TABLE [europe-asia].[dim_date]"
         )
         self.assertEqual(copied, 1)
         self.assertLess(bulk_index, truncate_index)
@@ -85,13 +85,13 @@ class AtomicReplacementTests(unittest.TestCase):
             _replace_with_rows(
                 cursor,
                 connection,
-                schema="canada",
+                schema="europe-asia",
                 table="dim_date",
                 fieldnames=["date", "load_date"],
                 rows=[],
             )
 
-        self.assertNotIn("TRUNCATE TABLE [canada].[dim_date]", cursor.events)
+        self.assertNotIn("TRUNCATE TABLE [europe-asia].[dim_date]", cursor.events)
         self.assertEqual(connection.rollbacks, 1)
 
 

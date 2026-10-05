@@ -58,8 +58,8 @@ class CitationDomainRuleTests(unittest.TestCase):
             [
                 {
                     "category": "other",
-                    "hostname": "www.kisqali.com",
-                    "domain": "kisqali.com",
+                    "hostname": "www.ergon.com",
+                    "domain": "ergon.com",
                 }
             ],
             {},
@@ -68,19 +68,9 @@ class CitationDomainRuleTests(unittest.TestCase):
         self.assertIsNone(rows[0]["subcategory"])
         self.assertIsNone(rows[0]["pag"])
 
-    def test_brazil_file_loads_and_other_countries_do_not(self) -> None:
-        brazil = load_citation_domains("brazil")
-        self.assertEqual(
-            brazil["febrararas.org"],
-            ("Institutions", "Institution BR", "TRUE"),
-        )
-        self.assertEqual(
-            brazil["novartis.com.br"],
-            ("Owned", "Owned BR", "FALSE"),
-        )
-        self.assertNotIn("example.com", brazil)
-        self.assertEqual(load_citation_domains("canada"), {})
-        self.assertEqual(load_citation_domains("mexico"), {})
+    def test_missing_domain_file_is_empty(self) -> None:
+        self.assertEqual(load_citation_domains("americas-uk-au-uae"), {})
+        self.assertEqual(load_citation_domains("europe-asia"), {})
 
     def test_pag_blank_is_null_in_sql(self) -> None:
         self.assertIs(convert_value("pag", "TRUE", table="fact_raw_citations"), True)

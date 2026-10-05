@@ -81,19 +81,19 @@ class AuthorFromUrlTests(unittest.TestCase):
 
     def test_instagram_profile_and_embedded_post(self) -> None:
         self.assertEqual(
-            author_from_url("https://www.instagram.com/novartis/"),
-            "@novartis",
+            author_from_url("https://www.instagram.com/ergon/"),
+            "@ergon",
         )
         self.assertEqual(
-            author_from_url("https://www.instagram.com/novartis/reel/AbCdEf123/"),
-            "@novartis",
+            author_from_url("https://www.instagram.com/ergon/reel/AbCdEf123/"),
+            "@ergon",
         )
 
     def test_instagram_shortcode_only_is_blank(self) -> None:
         self.assertIsNone(author_from_url("https://www.instagram.com/p/AbCdEf123/"))
 
     def test_other_domains_are_blank(self) -> None:
-        self.assertIsNone(author_from_url("https://www.novartis.com/news"))
+        self.assertIsNone(author_from_url("https://www.ergon.com/news"))
 
 
 class ApplyAuthorsTests(unittest.TestCase):
@@ -235,15 +235,15 @@ class CitationExportTests(unittest.TestCase):
     def test_citation_row_includes_url_author(self) -> None:
         row = citation_row(
             day="2026-09-20",
-            topic="Oncology",
+            topic="Energy & Specialty Solutions",
             platform="ChatGPT",
             category="earned_media",
-            mentioned="Kisqali",
+            mentioned="Ergon",
             url="https://www.reddit.com/r/breastcancer/comments/abc/",
             hostname="www.reddit.com",
             path="/r/breastcancer/comments/abc/",
             tags="oncology",
-            region="Canada",
+            region="United States",
         )
         self.assertEqual(row["author"], "r/breastcancer")
 

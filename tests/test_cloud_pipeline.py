@@ -43,7 +43,7 @@ class CloudCountryPipelineTests(unittest.TestCase):
         with (
             patch(
                 "pipeline.cloud.select_country",
-                return_value=SimpleNamespace(slug="canada"),
+                return_value=SimpleNamespace(slug="europe-asia"),
             ) as select,
             patch(
                 "pipeline.cloud.export_scores",
@@ -59,9 +59,9 @@ class CloudCountryPipelineTests(unittest.TestCase):
             ) as citations,
             patch("pipeline.cloud.rebuild_dimensions_from_sql") as dimensions,
         ):
-            result = run_country("canada")
+            result = run_country("europe-asia")
 
-        select.assert_called_once_with("canada", create_data_dir=False)
+        select.assert_called_once_with("europe-asia", create_data_dir=False)
         scores.assert_called_once_with(csv_output=False, rebuild_dimensions=False)
         prompts.assert_called_once_with(csv_output=False)
         citations.assert_called_once_with(
@@ -71,7 +71,7 @@ class CloudCountryPipelineTests(unittest.TestCase):
             rebuild_dimensions=False,
         )
         dimensions.assert_called_once_with()
-        self.assertEqual(result["country"], "canada")
+        self.assertEqual(result["country"], "europe-asia")
 
 
 if __name__ == "__main__":

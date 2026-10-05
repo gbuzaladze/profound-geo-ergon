@@ -71,6 +71,7 @@ LOAD_TZ = ZoneInfo("America/Toronto")
 TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     _SCORES_TABLE: (
         ("date", "DATE NOT NULL"),
+        ("region", "NVARCHAR(200) NOT NULL"),
         ("topic", "NVARCHAR(200) NOT NULL"),
         ("platform", "NVARCHAR(200) NOT NULL"),
         ("asset", "NVARCHAR(200) NOT NULL"),
@@ -109,13 +110,15 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     "dim_date": (("date", "DATE NOT NULL"), _LOAD_DATE_DDL),
     "dim_topic": (("topic", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
     "dim_platform": (("platform", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
+    "dim_region": (("region", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
 }
 
 _PRIMARY_KEYS = {
     "dim_date": ("date",),
     "dim_topic": ("topic",),
     "dim_platform": ("platform",),
-    _SCORES_TABLE: ("date", "topic", "platform", "asset"),
+    "dim_region": ("region",),
+    _SCORES_TABLE: ("date", "region", "topic", "platform", "asset"),
 }
 _DATE_INDEXED = (_SCORES_TABLE, "fact_raw_citations")
 # Existing databases were created with NVARCHAR(200/2000). Widen to MAX so
@@ -537,10 +540,11 @@ def row_tuple(
 # share a primary key. Collapse before insert so CSV and SQL stay aligned.
 
 
-def _score_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+def _score_key(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
     """Case-insensitive scores grain matching Azure SQL CI collation."""
     return (
         str(row.get("date") or "").strip(),
+        str(row.get("region") or "").strip().casefold(),
         str(row.get("topic") or "").strip().casefold(),
         str(row.get("platform") or "").strip().casefold(),
         str(row.get("asset") or "").strip().casefold(),
@@ -550,8 +554,8 @@ def _score_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
 def _asset_name_rank(name: str) -> int:
     """Prefer display casing when two spellings share one CI key.
 
-    Lower is better: Title Case (`Leqvio`), then mixed (`AbbVie`), then
-    ALL CAPS (`FDA` / `LEQVIO`), then lowercase. Singleton names are left
+    Lower is better: Title Case (`Ergon`), then mixed (`Cargill`), then
+    ALL CAPS (`FDA` / `ERGON`), then lowercase. Singleton names are left
     alone by `_prefer_asset_name` so `FDA` is not rewritten to `Fda`.
     """
     if not name:
@@ -602,7 +606,7 @@ def _merge_score_row(
 
 def dedupe_score_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse case-variant asset names onto one row per scores grain."""
-    merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    merged: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for row in rows:
         key = _score_key(row)
         existing = merged.get(key)
@@ -829,6 +833,7 @@ def rebuild_dimensions_from_sql() -> None:
         "dim_date": "date",
         "dim_topic": "topic",
         "dim_platform": "platform",
+        "dim_region": "region",
     }
     with sql_connection() as conn:
         if conn is None:

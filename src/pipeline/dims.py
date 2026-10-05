@@ -1,6 +1,6 @@
 """Build Power BI dimension tables from exported fact CSVs.
 
-Dims are the union of keys in both facts so a slicer on dim_topic/date/platform
+Dims are the union of keys in both facts so a slicer on dim_topic/date/platform/region
 filters scores and citations together. Written after each fact export.
 """
 
@@ -20,6 +20,7 @@ from pipeline.config import (
 DIM_DATE_FIELDS = ["date"]
 DIM_TOPIC_FIELDS = ["topic"]
 DIM_PLATFORM_FIELDS = ["platform"]
+DIM_REGION_FIELDS = ["region"]
 
 
 def _fact_paths() -> list[Path]:
@@ -30,11 +31,12 @@ def _fact_paths() -> list[Path]:
     ]
 
 
-def collect_dim_keys() -> tuple[set[str], set[str], set[str]]:
-    """Return distinct date, topic, and platform values from available facts."""
+def collect_dim_keys() -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return distinct date, topic, platform, and region values from available facts."""
     dates: set[str] = set()
     topics: set[str] = set()
     platforms: set[str] = set()
+    regions: set[str] = set()
     for path in _fact_paths():
         if not path.exists():
             continue
@@ -42,13 +44,16 @@ def collect_dim_keys() -> tuple[set[str], set[str], set[str]]:
             date_value = str(row.get("date") or "").strip()
             topic_value = str(row.get("topic") or "").strip()
             platform_value = str(row.get("platform") or "").strip()
+            region_value = str(row.get("region") or "").strip()
             if date_value:
                 dates.add(date_value)
             if topic_value:
                 topics.add(topic_value)
             if platform_value:
                 platforms.add(platform_value)
-    return dates, topics, platforms
+            if region_value:
+                regions.add(region_value)
+    return dates, topics, platforms, regions
 
 
 def date_rows(dates: list[str]) -> list[dict[str, object]]:
@@ -57,12 +62,13 @@ def date_rows(dates: list[str]) -> list[dict[str, object]]:
 
 
 def write_dims() -> None:
-    """Write dim_date, dim_topic, and dim_platform from both fact tables."""
-    date_values, topic_values, platform_values = collect_dim_keys()
+    """Write dim_date, dim_topic, dim_platform, and dim_region from both fact tables."""
+    date_values, topic_values, platform_values, region_values = collect_dim_keys()
     dates = sorted(date_values)
     topics = sorted(topic_values)
     platforms = sorted(platform_values)
-    if not dates and not topics and not platforms:
+    regions = sorted(region_values)
+    if not dates and not topics and not platforms and not regions:
         print("No fact CSVs found; skipped dimension tables.")
         return
 
@@ -81,10 +87,16 @@ def write_dims() -> None:
             path=folder / "dim_platform.csv",
             fieldnames=DIM_PLATFORM_FIELDS,
         ),
+        write_csv_and_sql(
+            [{"region": value} for value in regions],
+            path=folder / "dim_region.csv",
+            fieldnames=DIM_REGION_FIELDS,
+        ),
     ]
     print(
         "Dimension tables written: "
-        f"{len(dates)} dates, {len(topics)} topics, {len(platforms)} platforms"
+        f"{len(dates)} dates, {len(topics)} topics, {len(platforms)} platforms, "
+        f"{len(regions)} regions"
     )
     for path in written:
         print(f"  {path}")
@@ -93,7 +105,7 @@ def write_dims() -> None:
 def main(argv: list[str] | None = None) -> None:
     """Rebuild dimension CSVs from existing fact exports."""
     parser = argparse.ArgumentParser(
-        description="Rebuild dim_date, dim_topic, and dim_platform."
+        description="Rebuild dim_date, dim_topic, dim_platform, and dim_region."
     )
     add_country_option(parser)
     args = parser.parse_args(argv)

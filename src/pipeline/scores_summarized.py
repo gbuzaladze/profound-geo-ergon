@@ -1,4 +1,4 @@
-"""Export date x topic x platform x asset scores for the ranked union.
+"""Export date x region x topic x platform x asset scores for the ranked union.
 
 Visibility, share of voice, and average position come from one summarized
 visibility query. Positive sentiment is a second v2 pull: that report requires
@@ -14,6 +14,7 @@ from time import perf_counter
 import profound
 from profound import Profound
 
+from pipeline.combine import combine_category_exports
 from pipeline.common import call_api, profound_client, ref_name, write_csv_and_sql
 from pipeline.config import (
     START_DATE,
@@ -43,6 +44,7 @@ RANK_METRICS: tuple[str, ...] = (
 )
 FIELDNAMES = [
     "date",
+    "region",
     "topic",
     "platform",
     "asset",
@@ -63,6 +65,7 @@ def flatten_record(record: object) -> dict[str, object]:
     name = ref_name(asset)
     return {
         "date": getattr(record, "date", None),
+        "region": ref_name(getattr(record, "region", None)),
         "topic": ref_name(getattr(record, "topic", None)),
         # Profound calls the LLM "model"; the warehouse column is platform.
         "platform": ref_name(getattr(record, "model", None)),
@@ -75,10 +78,11 @@ def flatten_record(record: object) -> dict[str, object]:
     }
 
 
-def score_key(row: dict[str, object]) -> tuple[str, str, str, str]:
-    """Grain key (date, topic, platform, asset) used for joins, fills, and sort."""
+def score_key(row: dict[str, object]) -> tuple[str, str, str, str, str]:
+    """Grain key (date, region, topic, platform, asset) used for joins, fills, and sort."""
     return (
         str(row.get("date") or ""),
+        str(row.get("region") or ""),
         str(row.get("topic") or ""),
         str(row.get("platform") or ""),
         str(row.get("asset") or ""),
@@ -107,10 +111,9 @@ def ensure_owned_assets(
 ) -> None:
     """Include the country's owned asset, plus aliases Profound tracks here.
 
-    The country `owned_asset` is always kept, even outside every top N.
-    Canada stays on Novartis. Mexico and Brazil stay on Novartis - Mexico and
-    Novartis - Brazil. An alias is added only when this category lists that
-    exact asset, so a generic name is not zero-filled beside the local brand.
+    The category `owned_asset` is always kept, even outside every top N.
+    An alias is added only when this category lists that
+    exact asset, so a generic name is not zero-filled beside the owned brand.
     """
     by_key = {name.casefold(): name for name, _owned in category_assets}
     present = {name.casefold(): name for name in owned_by_asset}
@@ -144,23 +147,23 @@ def zero_fill(
     assets: list[str],
     owned_by_asset: dict[str, bool],
 ) -> list[dict[str, object]]:
-    """Ensure every selected asset has a row for each date/topic/platform.
+    """Ensure every selected asset has a row for each date/region/topic/platform.
 
     Missing visibility and share_of_voice are set to 0. average_position and
     positive_sentiment stay blank when the asset was not present.
 
     Mutates owned_by_asset in place: an asset is owned if any series row says so.
     """
-    existing: dict[tuple[str, str, str, str], dict[str, object]] = {}
-    date_topic_platforms: set[tuple[str, str, str]] = set()
+    existing: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
+    date_region_topic_platforms: set[tuple[str, str, str, str]] = set()
 
     for row in rows:
-        date, topic, platform, asset = score_key(row)
-        if not (date and topic and platform and asset):
+        date, region, topic, platform, asset = score_key(row)
+        if not (date and region and topic and platform and asset):
             continue
 
-        existing[(date, topic, platform, asset)] = row
-        date_topic_platforms.add((date, topic, platform))
+        existing[(date, region, topic, platform, asset)] = row
+        date_region_topic_platforms.add((date, region, topic, platform))
         if asset in owned_by_asset:
             owned_by_asset[asset] = (
                 bool(row.get("is_owned"))
@@ -170,15 +173,16 @@ def zero_fill(
             row["is_owned"] = owned_by_asset[asset]
 
     filled: list[dict[str, object]] = []
-    for date, topic, platform in date_topic_platforms:
+    for date, region, topic, platform in date_region_topic_platforms:
         for asset in assets:
-            row = existing.get((date, topic, platform, asset))
+            row = existing.get((date, region, topic, platform, asset))
             if row is not None:
                 filled.append(row)
                 continue
             filled.append(
                 {
                     "date": date,
+                    "region": region,
                     "topic": topic,
                     "platform": platform,
                     "asset": asset,
@@ -300,8 +304,13 @@ def _sentiment_pages(
     start: str,
     scan_end: str,
     group_by: list[str],
+    topic: str | None = None,
 ) -> tuple[list[object], int]:
-    """Page one v2 sentiment query. 400/404/422 means the brand is untracked."""
+    """Page one v2 sentiment query. 400/404/422 means the brand is untracked.
+
+    Sentiment accepts at most two group_by dimensions besides date, so a
+    regional series filters one topic at a time and groups by region and model.
+    """
     rows: list[object] = []
     cursor: str | None = None
     api_calls = 0
@@ -320,6 +329,8 @@ def _sentiment_pages(
         if grouped_by_date:
             # interval is only valid when the query is grouped by date.
             kwargs["interval"] = "day"
+        if topic:
+            kwargs["filter"] = {"field": "topic", "op": "is", "value": topic}
         if cursor:
             kwargs["cursor"] = cursor
         try:
@@ -387,40 +398,46 @@ def fetch_sentiment(
     *,
     assets: list[str],
     scan_end: str,
-) -> tuple[dict[tuple[str, str, str, str], float], int]:
+) -> tuple[dict[tuple[str, str, str, str, str], float], int]:
     """Return positive sentiment keyed by the scores grain.
 
     Rows for topics/platforms that never appear in visibility are dropped
     on join (see attach_sentiment).
     """
-    values: dict[tuple[str, str, str, str], float] = {}
+    values: dict[tuple[str, str, str, str, str], float] = {}
     api_calls = 0
+    # date + region + model is the regional grain. Topic is a filter because
+    # sentiment rejects a third group_by dimension.
+    topics, topic_calls = list_topic_names(client)
+    api_calls += topic_calls
     for asset in assets:
-        records, calls = _sentiment_pages(
-            client,
-            asset=asset,
-            start=START_DATE,
-            scan_end=scan_end,
-            group_by=["date", "topic", "model"],
-        )
-        api_calls += calls
         row_count = 0
-        for record in records:
-            day = str(getattr(record, "date", "") or "")
-            topic = ref_name(getattr(record, "topic", None))
-            platform = ref_name(getattr(record, "model", None))
-            share = sentiment_share(getattr(record, "positive_sentiment", None))
-            if not day or not topic or not platform or share is None:
-                continue
-            values[(day, topic, platform, asset)] = share
-            row_count += 1
+        for topic in topics:
+            records, calls = _sentiment_pages(
+                client,
+                asset=asset,
+                start=START_DATE,
+                scan_end=scan_end,
+                group_by=["date", "region", "model"],
+                topic=topic,
+            )
+            api_calls += calls
+            for record in records:
+                day = str(getattr(record, "date", "") or "")
+                region = ref_name(getattr(record, "region", None))
+                platform = ref_name(getattr(record, "model", None))
+                share = sentiment_share(getattr(record, "positive_sentiment", None))
+                if not day or not region or not platform or share is None:
+                    continue
+                values[(day, region, topic, platform, asset)] = share
+                row_count += 1
         print(f"  sentiment {asset}: {row_count} rows")
     return values, api_calls
 
 
 def attach_sentiment(
     rows: list[dict[str, object]],
-    sentiment: dict[tuple[str, str, str, str], float],
+    sentiment: dict[tuple[str, str, str, str, str], float],
 ) -> int:
     """Left-join sentiment onto score rows. Unmatched keys stay blank."""
     matched = 0
@@ -499,7 +516,7 @@ def fetch_summarized(
     assets: list[str],
     scan_end: str,
 ) -> tuple[list[dict[str, object]], int]:
-    """Page through date x topic x platform rows for the selected assets."""
+    """Page through date x region x topic x platform rows for the selected assets."""
     rows: list[dict[str, object]] = []
     cursor: str | None = None
     pages = 0
@@ -514,7 +531,7 @@ def fetch_summarized(
             end_date=scan_end,
             assets=assets,
             metrics=list(RANK_METRICS),
-            group_by=["date", "model", "topic"],
+            group_by=["date", "model", "topic", "region"],
             interval="day",
             scope="all",
             limit=PAGE_SIZE,
@@ -600,7 +617,7 @@ def export(
     print(f"Series window: {START_DATE} through {scan_end}")
     if dates:
         print(f"Available data range: {dates[0]} through {dates[-1]}")
-    print("Grouped by: date, topic, platform, asset")
+    print("Grouped by: date, region, topic, platform, asset")
     return {
         "table": "fact_scores_summarized",
         "rows": len(rows),
@@ -620,6 +637,7 @@ def main(argv: list[str] | None = None) -> None:
         select_country(country.slug)
         print(f"Scores: {country.name}", flush=True)
         export()
+    combine_category_exports()
 
 
 if __name__ == "__main__":

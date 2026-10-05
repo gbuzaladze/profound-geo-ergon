@@ -1,8 +1,7 @@
 """Load shared Profound export settings from project.toml.
 
 This is the only place client names, category IDs, and scan windows are read.
-Secrets stay in `.env`. Importing this module also moves leftover Canada CSVs
-from a flat `data/` folder into `data/canada/` if that country is configured.
+Secrets stay in `.env`.
 """
 
 from __future__ import annotations
@@ -21,16 +20,6 @@ from dotenv import load_dotenv
 
 _SETTINGS_NAME = "project.toml"
 _PIPELINE_TZ = ZoneInfo("America/Toronto")
-_LEGACY_DATA_FILES = (
-    "fact_scores_summarized.csv",
-    "fact_raw_citations.csv",
-    "fact_raw_citations.partial.csv",
-    "fact_raw_citations.checkpoint.json",
-    "dim_prompt.csv",
-    "dim_date.csv",
-    "dim_topic.csv",
-    "dim_platform.csv",
-)
 
 
 def project_root() -> Path:
@@ -125,8 +114,7 @@ def _as_slug(value: object, key: str) -> str:
 class Country:
     """One Profound category exported into data/{slug}/ and schema {slug}.
 
-    `owned_asset` is the Profound brand name used for dashboard KPIs; it may
-    differ by market (e.g. `Novartis - Mexico`).
+    `owned_asset` is the Profound brand name used for dashboard KPIs.
     """
 
     slug: str
@@ -248,9 +236,9 @@ def is_owned_citation_host(
     """True when hostname or domain is forced to the Owned citation category.
 
     An owned_citation_hosts entry matches the hostname, the registrable domain,
-    or a parent of the hostname (novartis.com matches www.novartis.com).
+    or a parent of the hostname (ergon.com matches www.ergon.com).
     An owned_citation_contains token matches when it appears anywhere in the
-    hostname or domain, so novartis covers novartis.com.br and novartis.com.mx.
+    hostname or domain, so ergon covers country sites that include that text.
     """
     host = _host_key(hostname)
     domain_key = _host_key(domain)
@@ -281,32 +269,6 @@ def owned_asset_names() -> tuple[str, ...]:
         seen.add(folded)
         names.append(alias)
     return tuple(names)
-
-
-# Legacy Canada layout
-
-
-def migrate_legacy_flat_data() -> None:
-    """Move original Canada CSVs from data/ into data/canada/."""
-    canada = _COUNTRIES_BY_SLUG.get("canada")
-    if canada is None:
-        return
-    root_data = project_root() / "data"
-    moved = 0
-    for name in _LEGACY_DATA_FILES:
-        source = root_data / name
-        if not source.is_file():
-            continue
-        canada.data_dir.mkdir(parents=True, exist_ok=True)
-        destination = canada.data_dir / name
-        if destination.exists():
-            print(f"Keeping {destination}; left legacy {source} in place.")
-            continue
-        source.replace(destination)
-        moved += 1
-        print(f"Moved {source.name} -> {destination}")
-    if moved:
-        print(f"Migrated {moved} Canada export files into {canada.data_dir}.")
 
 
 def country_by_slug(slug: str) -> Country:
@@ -424,6 +386,3 @@ def drop_incomplete_dates[RowT: dict](rows: list[RowT]) -> list[RowT]:
         print(f"Dropped {dropped} rows dated {cutoff} or later.")
     return kept
 
-
-# Runs on import so old single-folder Canada exports land in data/canada/.
-migrate_legacy_flat_data()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 
+from pipeline.combine import combine_category_exports
 from pipeline.config import add_country_option, countries_from_args, select_country
 from pipeline.db import set_skip_sql
 from pipeline.prompts import export as export_prompts
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
         export_scores_summarized()
         export_prompts()
         export_raw_citations(mode=citations_mode, fresh=args.fresh)
+    combine_category_exports()
 
 
 if __name__ == "__main__":

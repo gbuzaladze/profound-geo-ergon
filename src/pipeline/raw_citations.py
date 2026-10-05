@@ -31,6 +31,7 @@ from pipeline.common import (
     ref_name,
     write_csv_and_sql,
 )
+from pipeline.combine import combine_category_exports
 from pipeline.config import (
     HOURLY_API_LIMIT,
     START_DATE,
@@ -818,6 +819,8 @@ def main(argv: list[str] | None = None) -> None:
             continue
         mode = "full" if args.full else ("incremental" if args.incremental else None)
         export(mode=mode, fresh=args.fresh)
+    if not args.enrich_authors:
+        combine_category_exports()
 
 
 def main_full() -> None:

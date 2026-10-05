@@ -1,12 +1,13 @@
-# Novartis GEO Pipeline (Canada, Mexico, Brazil)
+# Ergon GEO Pipeline
 
-Reusable pipeline: `project.toml` lists one Profound category per country and
-exports the same tables into a folder for each market:
+Reusable pipeline: `project.toml` lists one Profound category per entry and
+exports the same tables into a folder for each category. Ergon countries are
+the `region` column on the score fact, not separate categories.
 
-- `data/{country}/fact_scores_summarized` — daily visibility, share of voice, average position, and positive sentiment
-- `data/{country}/fact_raw_citations` — one row per citation from Visibility answers
-- `data/{country}/dim_prompt` — active Visibility prompts in the category
-- `data/{country}/dim_date`, `dim_topic`, `dim_platform` — distinct keys from both facts
+- `data/{slug}/fact_scores_summarized` — daily visibility, share of voice, average position, and positive sentiment, by region
+- `data/{slug}/fact_raw_citations` — one row per citation from Visibility answers
+- `data/{slug}/dim_prompt` — active Visibility prompts in the category
+- `data/{slug}/dim_date`, `dim_topic`, `dim_platform`, `dim_region` — distinct keys from both facts
 
 ## Requirements
 
@@ -26,12 +27,12 @@ Shared settings live under `[project]` in `project.toml` (`owned_asset`,
 `owned_aliases`, `owned_citation_hosts`, `owned_citation_contains`,
 `start_date`). Each market is a
 `[[countries]]` table with `slug`, `name`, and `category_id`. Set
-`owned_asset` on a country when Profound uses a local brand name
-(`Novartis - Mexico`). `owned_aliases` are marked `is_owned` and pulled only
-when that category tracks the exact name. The country's `owned_asset` is
+`owned_asset` on an entry when Profound uses a different brand name.
+`owned_aliases` are marked `is_owned` and pulled only
+when that category tracks the exact name. The entry's `owned_asset` is
 always pulled. The API key stays in `.env`. Azure SQL credentials stay there
 too; the pipeline writes CSVs under `data/{slug}/` and replaces the same
-tables in schema `{slug}` (`canada`, `mexico`, `brazil`).
+tables in schema `{slug}` (`americas-uk-au-uae`, `europe-asia`).
 
 ## Scheduled Azure Function
 
@@ -83,8 +84,8 @@ key or SQL password in Bicep parameters or Function App settings.
    should be marked `is_owned` when that category tracks the exact name.
    Add `owned_citation_hosts` for hostnames or domains whose citation
    `category` should be `Owned`. Add `owned_citation_contains` for text that
-   should match any hostname or domain, such as `novartis` for
-   `novartis.com.br` and `novartis.com.mx`.
+   should match any hostname or domain, such as `ergon` for
+   `ergon.com`.
 3. Set `PROFOUND_API_KEY` and the `AZURE_SQL_*` values in `.env`.
    Allow your client IP on the Azure SQL firewall.
 4. Delete `data/` if it still has exports from a previous project.
@@ -117,28 +118,22 @@ Fresh citations backfill from `START_DATE` (not incremental):
 One market only:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pipeline --country canada
-.\.venv\Scripts\python.exe -m pipeline --country mexico --country brazil
+.\.venv\Scripts\python.exe -m pipeline --country americas-uk-au-uae
+.\.venv\Scripts\python.exe -m pipeline --country europe-asia
 ```
 
 ```text
-data/canada/fact_scores_summarized.csv
-data/canada/fact_raw_citations.csv
-data/canada/dim_prompt.csv
-data/canada/dim_date.csv
-data/canada/dim_topic.csv
-data/canada/dim_platform.csv
-data/mexico/...
-data/brazil/...
-
-Azure SQL schemas canada / mexico / brazil
-  fact_scores_summarized
-  fact_raw_citations
-  dim_prompt
-  dim_date
-  dim_topic
-  dim_platform
+data/fact_scores_summarized.csv
+data/fact_raw_citations.csv
+data/dim_prompt.csv
+data/dim_date.csv
+data/dim_topic.csv
+data/dim_platform.csv
+data/dim_region.csv
 ```
+
+Category folders are removed after the two Profound categories are concatenated.
+Country stays on the `region` column.
 
 CSV-only (skip Azure SQL):
 
@@ -155,18 +150,18 @@ several minutes per country.
 $env:PYTHONPATH = "src"
 $env:PYTHONUNBUFFERED = "1"
 .\.venv\Scripts\python.exe -m pipeline.db
-.\.venv\Scripts\python.exe -m pipeline.db --country canada
+.\.venv\Scripts\python.exe -m pipeline.db --country americas-uk-au-uae
 .\.venv\Scripts\python.exe -m pipeline.db --ensure-only
 ```
 
-Relate both facts many-to-one to `dim_date[date]`, `dim_topic[topic]`, and
-`dim_platform[platform]`. Put slicers on the dim tables so one filter applies
-to both facts.
+Relate both facts many-to-one to `dim_date[date]`, `dim_topic[topic]`,
+`dim_platform[platform]`, and `dim_region[region]`. Put slicers on the dim
+tables so one filter applies to both facts.
 
 ## fact_scores_summarized
 
-Pulls the Visibility Summarized view with **topic** included (date x topic x
-platform x asset). Ranking uses the last `LOOKBACK_DAYS` (default 30) to pick,
+Pulls the Visibility Summarized view with **topic** and **region** included
+(date x region x topic x platform x asset). Ranking uses the last `LOOKBACK_DAYS` (default 30) to pick,
 in **each topic**, the top `TOP_N` brands by visibility, by share of voice,
 by average position (lower is better), and by positive sentiment, then unions
 those lists. Sentiment ranking uses tracked category brands (v2 sentiment is
@@ -176,11 +171,11 @@ outside every top N. An `owned_aliases` name is included only when this
 category tracks that exact asset, and those names are marked `is_owned`
 even when Profound tracks them as separate unowned assets.
 
-Columns: `date`, `topic`, `platform`, `asset`, `is_owned`, `visibility`,
+Columns: `date`, `region`, `topic`, `platform`, `asset`, `is_owned`, `visibility`,
 `share_of_voice`, `average_position`, `positive_sentiment`.
 
 After the pull, every selected asset is zero-filled for every observed
-`date` × `topic` × `platform` (`visibility` and `share_of_voice` = 0 when
+`date` × `region` × `topic` × `platform` (`visibility` and `share_of_voice` = 0 when
 absent). `average_position` and `positive_sentiment` stay blank when missing.
 Positive sentiment is merged from a second v2 sentiment pull for category
 brands and stored as a 0–1 share (same scale as visibility). Other brands in
@@ -189,7 +184,7 @@ the visibility union stay blank.
 ```powershell
 $env:PYTHONPATH = "src"
 .\.venv\Scripts\python.exe -m pipeline.scores_summarized
-.\.venv\Scripts\python.exe -m pipeline.scores_summarized --country mexico
+.\.venv\Scripts\python.exe -m pipeline.scores_summarized --country europe-asia
 ```
 
 ## dim_prompt
@@ -218,10 +213,9 @@ category and sets `subcategory` and `pag` (`TRUE` or `FALSE`). The file
 category is stored with Profound's labels (`Institution` becomes
 `Institutions`). A domain that
 is not in the file keeps the Profound category, with `subcategory` and `pag`
-blank. Canada and Mexico use the same columns; their files are added when
-those lists exist. `domain` is the
+blank. `domain` is the
 registrable domain from `hostname` via the Public Suffix List (e.g.
-`us.kisqali.com` → `kisqali.com`, `bccancer.bc.ca` → `bccancer.bc.ca`).
+`www.ergon.com` → `ergon.com`).
 
 `author` is filled for Reddit, YouTube, and Instagram citation URLs:
 
@@ -251,8 +245,8 @@ Recompute authors on an existing CSV without a Profound pull:
 ```powershell
 $env:PYTHONPATH = "src"
 $env:PYTHONUNBUFFERED = "1"
-.\.venv\Scripts\python.exe -m pipeline.raw_citations --enrich-authors --country mexico
-.\.venv\Scripts\python.exe -m pipeline.raw_citations --enrich-authors --country brazil
+.\.venv\Scripts\python.exe -m pipeline.raw_citations --enrich-authors --country americas-uk-au-uae
+.\.venv\Scripts\python.exe -m pipeline.raw_citations --enrich-authors --country europe-asia
 ```
 
 ### Original pull
@@ -265,14 +259,14 @@ checkpoint is saved after each page so an interrupted run can resume.
 $env:PYTHONPATH = "src"
 $env:PYTHONUNBUFFERED = "1"
 .\.venv\Scripts\python.exe -m pipeline.raw_citations --full
-.\.venv\Scripts\python.exe -m pipeline.raw_citations --full --country brazil
+.\.venv\Scripts\python.exe -m pipeline.raw_citations --full --country europe-asia
 ```
 
 Restart a failed backfill with the same command. To discard the checkpoint
 and start over:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pipeline.raw_citations --full --fresh --country canada
+.\.venv\Scripts\python.exe -m pipeline.raw_citations --full --fresh --country americas-uk-au-uae
 ```
 
 ### Incremental pull

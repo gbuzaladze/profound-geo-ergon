@@ -271,7 +271,7 @@ def resolve_youtube_video(url: str) -> str | None:
     oembed_url = YOUTUBE_OEMBED.format(url=quote(url, safe=""))
     request = Request(
         oembed_url,
-        headers={"User-Agent": "Novartis-GEO-citation-author"},
+        headers={"User-Agent": "Ergon-GEO-citation-author"},
     )
     try:
         with urlopen(request, timeout=_OEMBED_TIMEOUT_SECONDS) as response:

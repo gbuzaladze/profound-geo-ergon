@@ -1,4 +1,4 @@
-"""Owned-asset selection stays on the country brand, not a generic alias."""
+"""Owned-asset selection stays on the configured Ergon brand."""
 
 from __future__ import annotations
 
@@ -9,42 +9,26 @@ from pipeline.scores_summarized import ensure_owned_assets
 
 
 class EnsureOwnedAssetsTests(unittest.TestCase):
-    def test_mexico_keeps_local_brand_and_tracked_products(self) -> None:
-        select_country("mexico", create_data_dir=False)
+    def test_ergon_is_kept_when_unranked(self) -> None:
+        select_country("europe-asia", create_data_dir=False)
         names: list[str] = []
         owned: dict[str, bool] = {}
 
-        ensure_owned_assets(
-            names,
-            owned,
-            [("Novartis - Mexico", True), ("Kesimpta", False)],
-        )
+        ensure_owned_assets(names, owned, [("Cargill", False), ("Shell", False)])
 
-        self.assertEqual(names, ["Novartis - Mexico", "Kesimpta"])
-        self.assertNotIn("Novartis", names)
-        self.assertNotIn("Fabhalta", names)
-        self.assertTrue(owned["Novartis - Mexico"])
-        self.assertTrue(owned["Kesimpta"])
+        self.assertEqual(names, ["Ergon"])
+        self.assertNotIn("Cargill", names)
+        self.assertTrue(owned["Ergon"])
 
-    def test_brazil_skips_generic_novartis_alias(self) -> None:
-        select_country("brazil", create_data_dir=False)
-        names: list[str] = ["Novartis - Brazil"]
-        owned = {"Novartis - Brazil": True}
+    def test_tracked_ergon_is_marked_owned(self) -> None:
+        select_country("americas-uk-au-uae", create_data_dir=False)
+        names: list[str] = ["Ergon"]
+        owned = {"Ergon": False}
 
-        ensure_owned_assets(names, owned, [("Novartis - Brazil", True)])
+        ensure_owned_assets(names, owned, [("Ergon", True)])
 
-        self.assertEqual(names, ["Novartis - Brazil"])
-        self.assertNotIn("Novartis", names)
-
-    def test_canada_keeps_novartis_when_unranked(self) -> None:
-        select_country("canada", create_data_dir=False)
-        names: list[str] = []
-        owned: dict[str, bool] = {}
-
-        ensure_owned_assets(names, owned, [("Kesimpta", False)])
-
-        self.assertEqual(names, ["Novartis", "Kesimpta"])
-        self.assertTrue(owned["Novartis"])
+        self.assertEqual(names, ["Ergon"])
+        self.assertTrue(owned["Ergon"])
 
 
 if __name__ == "__main__":

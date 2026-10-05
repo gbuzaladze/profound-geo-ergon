@@ -1,4 +1,4 @@
-"""Owned citation hosts include country-code Novartis domains."""
+"""Owned citation hosts match Ergon domains."""
 
 from __future__ import annotations
 
@@ -8,32 +8,16 @@ from pipeline.config import is_owned_citation_host
 
 
 class OwnedCitationHostTests(unittest.TestCase):
-    def test_novartis_in_the_domain_is_owned(self) -> None:
-        self.assertTrue(is_owned_citation_host("novartis.com.br", "novartis.com.br"))
-        self.assertTrue(
-            is_owned_citation_host("www.novartis.com.mx", "novartis.com.mx")
-        )
-        self.assertTrue(is_owned_citation_host("www.novartis.com", "novartis.com"))
+    def test_ergon_in_the_domain_is_owned(self) -> None:
+        self.assertTrue(is_owned_citation_host("ergon.com", "ergon.com"))
+        self.assertTrue(is_owned_citation_host("www.ergon.com", "ergon.com"))
 
     def test_unrelated_domain_stays_unowned(self) -> None:
-        self.assertFalse(is_owned_citation_host("example.com.br", "example.com.br"))
+        self.assertFalse(is_owned_citation_host("example.com", "example.com"))
+        self.assertFalse(is_owned_citation_host("shell.com", "shell.com"))
 
-    def test_listed_product_host_is_still_owned(self) -> None:
-        hosts = (
-            ("www.kisqali.com", "kisqali.com"),
-            ("fabhalta.com", "fabhalta.com"),
-            ("www.fabhalta-hcp.com", "fabhalta-hcp.com"),
-            ("fabhalta-id.com", "fabhalta-id.com"),
-            ("zolgensma.com", "zolgensma.com"),
-            ("zolgensma-hcp.com", "zolgensma-hcp.com"),
-            ("zolgensma-enrollment.com", "zolgensma-enrollment.com"),
-            ("zolgensma-itvisma-copayassist.com", "zolgensma-itvisma-copayassist.com"),
-            ("zolgensmacopayassist.com", "zolgensmacopayassist.com"),
-            ("zolgensmareimbursement.com", "zolgensmareimbursement.com"),
-        )
-        for hostname, domain in hosts:
-            with self.subTest(domain=domain):
-                self.assertTrue(is_owned_citation_host(hostname, domain))
+    def test_listed_host_is_owned(self) -> None:
+        self.assertTrue(is_owned_citation_host("www.ergon.com", "ergon.com"))
 
 
 if __name__ == "__main__":
