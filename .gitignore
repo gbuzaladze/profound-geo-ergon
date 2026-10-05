@@ -1,0 +1,27 @@
+# Local credentials and Azure Functions settings
+.env
+local.settings.json
+
+# Python environments, caches, and build outputs
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Generated exports and reporting artifacts
+data/*.csv
+data/*.json
+data/**/*.csv
+data/**/*.json
+dashboard/
+scripts/
+sql/
+power bi/
+*.pbix
+
+# Local Instagram tooling
+Instagram/

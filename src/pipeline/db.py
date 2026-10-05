@@ -1,0 +1,948 @@
+"""Load pipeline tables into Azure SQL (one schema per country slug).
+
+Exports still write CSVs; this module then replaces `{slug}.{table}` with a
+truncate + bulk copy. `load_date` is America/Toronto wall time (DATETIME2,
+no offset). Citations have no primary key (duplicate rows are valid). Scores
+collapse case-variant asset names before insert because Azure SQL collation
+is case-insensitive.
+
+    python -m pipeline.db              # load existing CSVs
+    python -m pipeline.db --country SLUG
+    python -m pipeline.db --ensure-only
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+from mssql_python import connect
+
+from pipeline.config import (
+    active_country,
+    add_country_option,
+    countries_from_args,
+    project_root,
+    select_country,
+)
+
+# Bulk copy: 5k rows per TDS batch; 1 hour covers the large citation CSVs.
+_BULK_BATCH_SIZE = 5000
+_BULK_TIMEOUT_SECONDS = 3600
+_CONNECT_TIMEOUT_SECONDS = 60
+
+# Set by --skip-db so exporters can still write CSVs without Azure credentials.
+_SKIP_ENV = "AZURE_SQL_SKIP"
+_SQL_REQUIRED_ENV = (
+    "AZURE_SQL_SERVER",
+    "AZURE_SQL_DATABASE",
+)
+_SQL_PASSWORD_ENV = (
+    "AZURE_SQL_USERNAME",
+    "AZURE_SQL_PASSWORD",
+)
+_FLOAT_COLUMNS = frozenset(
+    {
+        "visibility",
+        "share_of_voice",
+        "average_position",
+        "positive_sentiment",
+    }
+)
+
+_SCORES_TABLE = "fact_scores_summarized"
+LOAD_DATE_COLUMN = "load_date"
+_LOAD_DATE_DDL = (LOAD_DATE_COLUMN, "DATETIME2 NOT NULL")
+LOAD_TZ = ZoneInfo("America/Toronto")
+
+# DDL used when a table is missing. Existing tables are left in place and
+# only widened (see _WIDEN_TO_MAX) so CSV URLs/paths are not truncated.
+# load_date is America/Toronto wall time; it is not part of any primary key.
+TABLES: dict[str, tuple[tuple[str, str], ...]] = {
+    _SCORES_TABLE: (
+        ("date", "DATE NOT NULL"),
+        ("topic", "NVARCHAR(200) NOT NULL"),
+        ("platform", "NVARCHAR(200) NOT NULL"),
+        ("asset", "NVARCHAR(200) NOT NULL"),
+        ("is_owned", "BIT NOT NULL"),
+        ("visibility", "DECIMAL(38, 16) NOT NULL"),
+        ("share_of_voice", "DECIMAL(38, 16) NOT NULL"),
+        ("average_position", "DECIMAL(38, 16) NULL"),
+        ("positive_sentiment", "DECIMAL(38, 16) NULL"),
+        _LOAD_DATE_DDL,
+    ),
+    "fact_raw_citations": (
+        ("date", "DATE NOT NULL"),
+        ("topic", "NVARCHAR(200) NOT NULL"),
+        ("platform", "NVARCHAR(200) NOT NULL"),
+        ("category", "NVARCHAR(200) NULL"),
+        ("subcategory", "NVARCHAR(200) NULL"),
+        ("pag", "BIT NULL"),
+        ("mentioned", "NVARCHAR(MAX) NULL"),
+        ("url", "NVARCHAR(MAX) NULL"),
+        ("hostname", "NVARCHAR(200) NULL"),
+        ("domain", "NVARCHAR(200) NULL"),
+        ("path", "NVARCHAR(MAX) NULL"),
+        ("author", "NVARCHAR(200) NULL"),
+        ("tags", "NVARCHAR(MAX) NULL"),
+        ("region", "NVARCHAR(200) NULL"),
+        _LOAD_DATE_DDL,
+    ),
+    "dim_prompt": (
+        ("prompt", "NVARCHAR(MAX) NOT NULL"),
+        ("topic", "NVARCHAR(200) NOT NULL"),
+        ("tags", "NVARCHAR(MAX) NULL"),
+        ("regions", "NVARCHAR(MAX) NULL"),
+        ("platforms", "NVARCHAR(MAX) NULL"),
+        _LOAD_DATE_DDL,
+    ),
+    "dim_date": (("date", "DATE NOT NULL"), _LOAD_DATE_DDL),
+    "dim_topic": (("topic", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
+    "dim_platform": (("platform", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
+}
+
+_PRIMARY_KEYS = {
+    "dim_date": ("date",),
+    "dim_topic": ("topic",),
+    "dim_platform": ("platform",),
+    _SCORES_TABLE: ("date", "topic", "platform", "asset"),
+}
+_DATE_INDEXED = (_SCORES_TABLE, "fact_raw_citations")
+# Existing databases were created with NVARCHAR(200/2000). Widen to MAX so
+# Mexico citation URLs and long prompt text are not truncated.
+_WIDEN_TO_MAX = {
+    "fact_raw_citations": (
+        ("mentioned", True),
+        ("url", True),
+        ("path", True),
+        ("tags", True),
+    ),
+    "dim_prompt": (
+        ("prompt", False),
+        ("tags", True),
+        ("regions", True),
+        ("platforms", True),
+    ),
+}
+_NOT_NULL_COLUMNS = {
+    table: frozenset(name for name, ddl in columns if "NOT NULL" in ddl)
+    for table, columns in TABLES.items()
+}
+
+_skip_notice_shown = False
+_enabled_notice_shown = False
+
+
+# Connection
+
+
+def skip_sql() -> bool:
+    """True when AZURE_SQL_SKIP is set (CSV-only run)."""
+    return os.getenv(_SKIP_ENV, "").strip() in {"1", "true", "yes"}
+
+
+def set_skip_sql(skip: bool) -> None:
+    """Honor --skip-db by setting AZURE_SQL_SKIP for this process."""
+    if skip:
+        os.environ[_SKIP_ENV] = "1"
+    else:
+        os.environ.pop(_SKIP_ENV, None)
+
+
+def _sql_env() -> dict[str, str] | None:
+    """Return Azure SQL settings, or None when SQL is unused.
+
+    Server and database are always required. Username/password remain supported
+    for local CLI runs; when both are omitted, Azure managed identity is used.
+    """
+    load_dotenv(project_root() / ".env")
+    keys = _SQL_REQUIRED_ENV + _SQL_PASSWORD_ENV
+    values = {key: (os.getenv(key) or "").strip() for key in keys}
+    required_present = [key for key in _SQL_REQUIRED_ENV if values[key]]
+    if not required_present and not any(values[key] for key in _SQL_PASSWORD_ENV):
+        return None
+    required_missing = [key for key in _SQL_REQUIRED_ENV if not values[key]]
+    if required_missing:
+        joined = ", ".join(required_missing)
+        raise SystemExit(
+            f"Azure SQL configuration is missing {joined}. Set both "
+            "AZURE_SQL_SERVER and AZURE_SQL_DATABASE."
+        )
+    password_present = [key for key in _SQL_PASSWORD_ENV if values[key]]
+    if len(password_present) == 1:
+        missing = next(key for key in _SQL_PASSWORD_ENV if not values[key])
+        raise SystemExit(
+            f"Azure SQL configuration is missing {missing}. Set both SQL login "
+            "values, or omit both to use managed identity."
+        )
+    return values
+
+
+def _qualified(schema: str, table: str) -> str:
+    """Bracketed `[schema].[table]` identifier for Azure SQL."""
+    return f"[{schema}].[{table}]"
+
+
+def _connect(settings: dict[str, str]):
+    """Open an encrypted Azure SQL connection.
+
+    Local SQL login credentials remain supported. Azure-hosted runs omit them
+    and authenticate with the Function App's managed identity.
+    """
+    if not settings["AZURE_SQL_USERNAME"]:
+        client_id = (os.getenv("AZURE_CLIENT_ID") or "").strip()
+        identity = f";User Id={client_id}" if client_id else ""
+        return connect(
+            "Server="
+            f"{settings['AZURE_SQL_SERVER']};"
+            f"Database={settings['AZURE_SQL_DATABASE']};"
+            "Encrypt=yes;TrustServerCertificate=no;"
+            "Connection Timeout=60;Authentication=ActiveDirectoryMSI"
+            f"{identity}"
+        )
+    return connect(
+        server=settings["AZURE_SQL_SERVER"],
+        database=settings["AZURE_SQL_DATABASE"],
+        uid=settings["AZURE_SQL_USERNAME"],
+        pwd=settings["AZURE_SQL_PASSWORD"],
+        encrypt="yes",
+        trust_server_certificate="no",
+        multisubnetfailover="yes",
+        timeout=_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
+@contextmanager
+def sql_connection():
+    """Yield an Azure SQL connection, or skip when SQL is not configured."""
+    if skip_sql():
+        yield None
+        return
+    settings = _sql_env()
+    if settings is None:
+        yield None
+        return
+    conn = _connect(settings)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# Schema
+
+
+def _table_column_sql(table: str) -> str:
+    """Column definitions for CREATE TABLE, in TABLES order."""
+    return ", ".join(f"[{name}] {ddl}" for name, ddl in TABLES[table])
+
+
+def ensure_schema_and_tables(cursor, schema: str) -> None:
+    """Create the country schema and the six reporting tables if they are missing.
+
+    Existing tables are not rebuilt, except `fact_raw_citations` when
+    `subcategory` and `pag` are missing or not immediately after `category`.
+    Narrow text columns are widened in place, and `load_date` is added when
+    absent.
+    """
+    # CREATE SCHEMA must be its own batch; run it only when the schema is new.
+    cursor.execute("SELECT 1 FROM sys.schemas WHERE name = ?", (schema,))
+    if cursor.fetchone() is None:
+        cursor.execute(f"CREATE SCHEMA [{schema}]")
+    for table in TABLES:
+        col_sql = _table_column_sql(table)
+        pk = _PRIMARY_KEYS.get(table)
+        pk_sql = ""
+        if pk:
+            pk_cols = ", ".join(f"[{name}]" for name in pk)
+            pk_sql = f", CONSTRAINT [PK_{table}] PRIMARY KEY ({pk_cols})"
+        cursor.execute(
+            f"""
+            IF OBJECT_ID(N'{schema}.{table}', N'U') IS NULL
+            CREATE TABLE {_qualified(schema, table)} (
+                {col_sql}{pk_sql}
+            )
+            """
+        )
+        _widen_existing_text_columns(cursor, schema, table)
+        _ensure_load_date_column(cursor, schema, table)
+        if table == "fact_raw_citations":
+            _ensure_citation_class_columns(cursor, schema)
+        if table in _DATE_INDEXED:
+            # Nonclustered date index for Power BI / slicer filters on large facts.
+            index_name = f"IX_{table}_date"
+            cursor.execute(
+                f"""
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = ? AND object_id = OBJECT_ID(N'{schema}.{table}')
+                )
+                CREATE INDEX [{index_name}] ON {_qualified(schema, table)} ([date])
+                """,
+                (index_name,),
+            )
+
+
+def _column_max_length(cursor, schema: str, table: str, column: str) -> int | None:
+    """Return sys.columns.max_length, or None if the column is missing."""
+    cursor.execute(
+        """
+        SELECT c.max_length
+        FROM sys.columns AS c
+        JOIN sys.tables AS t ON t.object_id = c.object_id
+        JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+        WHERE s.name = ? AND t.name = ? AND c.name = ?
+        """,
+        (schema, table, column),
+    )
+    row = cursor.fetchone()
+    return None if row is None else int(row[0])
+
+
+def _widen_existing_text_columns(cursor, schema: str, table: str) -> None:
+    """Widen citation/prompt text columns that were created narrower than the CSVs."""
+    for column, nullable in _WIDEN_TO_MAX.get(table, ()):
+        length = _column_max_length(cursor, schema, table, column)
+        # -1 is NVARCHAR(MAX); missing columns are skipped.
+        if length is None or length == -1:
+            continue
+        null_sql = "NULL" if nullable else "NOT NULL"
+        cursor.execute(
+            f"""
+            ALTER TABLE {_qualified(schema, table)}
+            ALTER COLUMN [{column}] NVARCHAR(MAX) {null_sql}
+            """
+        )
+
+
+def _ensure_load_date_column(cursor, schema: str, table: str) -> None:
+    """Add load_date to existing tables. Nullable until the next full replace."""
+    if _column_max_length(cursor, schema, table, LOAD_DATE_COLUMN) is not None:
+        return
+    cursor.execute(
+        f"ALTER TABLE {_qualified(schema, table)} ADD [{LOAD_DATE_COLUMN}] DATETIME2 NULL"
+    )
+
+
+def _table_column_names(cursor, schema: str, table: str) -> list[str]:
+    """Return column names in CREATE TABLE order."""
+    cursor.execute(
+        """
+        SELECT c.name
+        FROM sys.columns AS c
+        JOIN sys.tables AS t ON t.object_id = c.object_id
+        JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+        WHERE s.name = ? AND t.name = ?
+        ORDER BY c.column_id
+        """,
+        (schema, table),
+    )
+    return [str(row[0]) for row in cursor.fetchall()]
+
+
+def _columns_match(actual: list[str], desired: list[str]) -> bool:
+    """True when two column lists are the same names in the same order."""
+    return [name.casefold() for name in actual] == [name.casefold() for name in desired]
+
+
+def _ensure_citation_class_columns(cursor, schema: str) -> None:
+    """Put subcategory and pag immediately after category on an existing table.
+
+    SQL Server appends new columns, so a table created before those columns
+    is copied into a new table with the current column order. Rows keep their
+    existing values; the new columns stay null until the next citation load.
+    """
+    table = "fact_raw_citations"
+    desired = _columns(table)
+    actual = _table_column_names(cursor, schema, table)
+    if _columns_match(actual, desired):
+        return
+    staging = f"{table}__reorder"
+    qualified_stage = _qualified(schema, staging)
+    cursor.execute(
+        f"IF OBJECT_ID(N'{schema}.{staging}', N'U') IS NOT NULL "
+        f"DROP TABLE {qualified_stage}"
+    )
+    cursor.execute(
+        f"CREATE TABLE {qualified_stage} ({_table_column_sql(table)})"
+    )
+    present = {name.casefold() for name in actual}
+    shared = [name for name in desired if name.casefold() in present]
+    if shared:
+        cols = ", ".join(f"[{name}]" for name in shared)
+        cursor.execute(
+            f"INSERT INTO {qualified_stage} ({cols}) "
+            f"SELECT {cols} FROM {_qualified(schema, table)}"
+        )
+    cursor.execute(f"DROP TABLE {_qualified(schema, table)}")
+    cursor.execute(f"EXEC sp_rename N'{schema}.{staging}', N'{table}'")
+
+
+# Value conversion
+
+
+def _as_bool(value: object) -> bool:
+    """Treat CSV `true`/`1`/`yes` (any case) as True; everything else False."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"true", "1", "yes"}
+
+
+def _as_optional_bool(value: object) -> bool | None:
+    """Parse TRUE/FALSE. Blank stays NULL so an unmatched domain is not FALSE."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _as_float(value: object) -> float | None:
+    """Parse a numeric cell; blank CSV values become SQL NULL."""
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _as_date(value: object) -> date | None:
+    """Normalize CSV strings and Python dates to datetime.date.
+
+    ISO timestamps are truncated to YYYY-MM-DD so `2026-09-10T00:00:00` still
+    loads as a DATE.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value).strip()[:10])
+
+
+def _as_text(value: object) -> str | None:
+    """Stringify a cell; empty strings become SQL NULL."""
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def load_now() -> datetime:
+    """Current America/Toronto wall time, naive, for DATETIME2.
+
+    DATETIME2 does not store a timezone offset, so tzinfo is stripped after
+    converting. DST is handled by ZoneInfo (EDT vs EST).
+    """
+    return datetime.now(LOAD_TZ).replace(tzinfo=None)
+
+
+def stamp_load_date(
+    rows: list[dict[str, Any]], *, when: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Copy rows and set the same Toronto `load_date` on every row.
+
+    One timestamp per table replace, so CSV and SQL can be compared by load.
+    """
+    stamped_at = when or load_now()
+    return [{**row, LOAD_DATE_COLUMN: stamped_at} for row in rows]
+
+
+def _columns(table: str) -> list[str]:
+    """SQL column names in CREATE TABLE order, including load_date."""
+    return [name for name, _ddl in TABLES[table]]
+
+
+def _grain_columns(table: str) -> list[str]:
+    """Business keys/metrics only; load_date is a load stamp, not grain."""
+    return [name for name in _columns(table) if name != LOAD_DATE_COLUMN]
+
+
+def _to_naive_toronto(value: datetime) -> datetime:
+    """Drop tzinfo after converting aware values into America/Toronto."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(LOAD_TZ).replace(tzinfo=None)
+
+
+def _as_datetime(value: object) -> datetime | None:
+    """Parse a load_date cell into naive Toronto time.
+
+    Trailing Z is treated as UTC, then converted. Naive ISO strings are kept
+    as-is (already Toronto wall time from this pipeline).
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return _to_naive_toronto(value)
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return _to_naive_toronto(datetime.fromisoformat(text))
+
+
+def convert_value(column: str, value: object, *, table: str) -> object:
+    """Coerce a CSV or in-memory cell to the SQL column type.
+
+    NOT NULL numeric cells that are blank become 0; NOT NULL text becomes "".
+    Missing load_date is filled with the current Toronto timestamp.
+    """
+    not_null = column in _NOT_NULL_COLUMNS[table]
+    if column == LOAD_DATE_COLUMN:
+        return _as_datetime(value) or load_now()
+    if column == "is_owned":
+        return _as_bool(value)
+    if column == "pag":
+        return _as_optional_bool(value)
+    if column in _FLOAT_COLUMNS:
+        number = _as_float(value)
+        if number is None and not_null:
+            return 0.0
+        return number
+    if column == "date":
+        return _as_date(value)
+    text = _as_text(value)
+    if text is None and not_null:
+        return ""
+    return text
+
+
+def row_tuple(
+    row: dict[str, Any], fieldnames: list[str], *, table: str
+) -> tuple[object, ...]:
+    """Map a row dict onto the table column order."""
+    return tuple(convert_value(name, row.get(name), table=table) for name in fieldnames)
+
+
+# Score grain
+# Azure SQL default collation is case-insensitive, so "Brand" and "brand"
+# share a primary key. Collapse before insert so CSV and SQL stay aligned.
+
+
+def _score_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Case-insensitive scores grain matching Azure SQL CI collation."""
+    return (
+        str(row.get("date") or "").strip(),
+        str(row.get("topic") or "").strip().casefold(),
+        str(row.get("platform") or "").strip().casefold(),
+        str(row.get("asset") or "").strip().casefold(),
+    )
+
+
+def _asset_name_rank(name: str) -> int:
+    """Prefer display casing when two spellings share one CI key.
+
+    Lower is better: Title Case (`Leqvio`), then mixed (`AbbVie`), then
+    ALL CAPS (`FDA` / `LEQVIO`), then lowercase. Singleton names are left
+    alone by `_prefer_asset_name` so `FDA` is not rewritten to `Fda`.
+    """
+    if not name:
+        return 4
+    letters = [char for char in name if char.isalpha()]
+    rest = name[1:]
+    if name[:1].isupper() and rest and rest.islower():
+        return 0
+    if letters and all(char.islower() for char in letters):
+        return 3
+    if letters and all(char.isupper() for char in letters):
+        return 2
+    return 1
+
+
+def _prefer_asset_name(current: str, incoming: str) -> str:
+    """Keep a singleton spelling as-is; if two exist, prefer Title Case."""
+    if not current:
+        return incoming
+    if incoming and _asset_name_rank(incoming) < _asset_name_rank(current):
+        return incoming
+    return current
+
+
+def _merge_score_row(
+    current: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Union two case-variant score rows that share one SQL key."""
+    merged = dict(current)
+    merged["is_owned"] = _as_bool(current.get("is_owned")) or _as_bool(
+        incoming.get("is_owned")
+    )
+    merged["asset"] = _prefer_asset_name(
+        str(current.get("asset") or ""), str(incoming.get("asset") or "")
+    )
+    # Take the higher rate; zero-fill treats missing as 0.
+    for column in ("visibility", "share_of_voice"):
+        merged[column] = max(
+            _as_float(current.get(column)) or 0.0,
+            _as_float(incoming.get(column)) or 0.0,
+        )
+    # Sentiment/position stay blank unless one of the variants has a value.
+    for column in ("average_position", "positive_sentiment"):
+        if merged.get(column) in (None, "") and incoming.get(column) not in (None, ""):
+            merged[column] = incoming.get(column)
+    return merged
+
+
+def dedupe_score_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse case-variant asset names onto one row per scores grain."""
+    merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = _score_key(row)
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(row)
+        else:
+            merged[key] = _merge_score_row(existing, row)
+    return list(merged.values())
+
+
+def _collapse_scores_if_needed(
+    table: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Dedupe scores only; other tables keep duplicate rows as-is."""
+    if table != _SCORES_TABLE:
+        return rows
+    collapsed = dedupe_score_rows(rows)
+    if len(collapsed) != len(rows):
+        print(
+            f"  {table}: collapsed {len(rows)} rows to {len(collapsed)} "
+            "unique grains (case-insensitive asset names)",
+            flush=True,
+        )
+    return collapsed
+
+
+# Bulk load
+
+
+def _iter_row_tuples(
+    rows: Iterable[dict[str, Any]], fieldnames: list[str], *, table: str
+) -> Iterator[tuple[object, ...]]:
+    for row in rows:
+        yield row_tuple(row, fieldnames, table=table)
+
+
+def _iter_csv_tuples(
+    path: Path, fieldnames: list[str], *, table: str, load_at: datetime
+) -> Iterator[tuple[object, ...]]:
+    """Stream CSV rows without loading the whole file (citations are large)."""
+    with path.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            row[LOAD_DATE_COLUMN] = load_at
+            yield row_tuple(row, fieldnames, table=table)
+
+
+def _rewrite_csv_load_date(path: Path, table: str, load_at: datetime) -> None:
+    """Rewrite a CSV so it includes the same load_date just written to SQL.
+
+    Used by `python -m pipeline.db` so on-disk files match the database after a
+    CSV-only reload. Seconds precision keeps the stamp readable in Excel.
+    """
+    grain = _grain_columns(table)
+    fields = grain + [LOAD_DATE_COLUMN]
+    stamp = load_at.isoformat(timespec="seconds")
+    temp_path = path.with_name(path.stem + ".tmp.csv")
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        with temp_path.open("w", newline="", encoding="utf-8") as dest:
+            writer = csv.DictWriter(dest, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for row in reader:
+                row[LOAD_DATE_COLUMN] = stamp
+                writer.writerow(row)
+    temp_path.replace(path)
+
+
+def _replace_with_rows(
+    cursor,
+    conn,
+    *,
+    schema: str,
+    table: str,
+    fieldnames: list[str],
+    rows: Iterable[tuple[object, ...]],
+) -> int:
+    """Stage rows, then atomically replace the target. Returns rows copied."""
+    qualified = _qualified(schema, table)
+    stage = f"__stage_{table}_{uuid4().hex}"
+    qualified_stage = _qualified(schema, stage)
+    columns = ", ".join(f"[{name}]" for name in fieldnames)
+    cursor.execute(f"SELECT TOP 0 * INTO {qualified_stage} FROM {qualified}")
+    # bulkcopy opens its own connection, so the staging table must be committed.
+    conn.commit()
+    try:
+        result = cursor.bulkcopy(
+            qualified_stage,
+            rows,
+            batch_size=_BULK_BATCH_SIZE,
+            timeout=_BULK_TIMEOUT_SECONDS,
+            column_mappings=fieldnames,
+            table_lock=True,
+            keep_nulls=True,
+        )
+        copied = int(result.get("rows_copied") or 0)
+        cursor.execute(f"TRUNCATE TABLE {qualified}")
+        cursor.execute(
+            f"INSERT INTO {qualified} ({columns}) "
+            f"SELECT {columns} FROM {qualified_stage}"
+        )
+        cursor.execute(f"DROP TABLE {qualified_stage}")
+        conn.commit()
+        return copied
+    except Exception:
+        conn.rollback()
+        cursor.execute(
+            f"IF OBJECT_ID(N'{schema}.{stage}', N'U') IS NOT NULL "
+            f"DROP TABLE {qualified_stage}"
+        )
+        conn.commit()
+        raise
+
+
+def replace_table(
+    table: str,
+    rows: list[dict[str, Any]],
+    fieldnames: list[str],
+    *,
+    conn=None,
+) -> int | None:
+    """Replace one table in the active country's schema. None if SQL is skipped."""
+    global _skip_notice_shown, _enabled_notice_shown
+    if skip_sql() or _sql_env() is None:
+        if not _skip_notice_shown:
+            print("Azure SQL is not configured; writing CSVs only.")
+            _skip_notice_shown = True
+        return None
+
+    schema = active_country().slug
+    if table not in TABLES:
+        raise SystemExit(f"Unknown SQL table {table!r}.")
+    grain = _grain_columns(table)
+    provided = [name for name in fieldnames if name != LOAD_DATE_COLUMN]
+    if provided != grain:
+        raise SystemExit(
+            f"{table} column order {provided} does not match SQL grain {grain}."
+        )
+
+    own_connection = conn is None
+    if own_connection:
+        settings = _sql_env()
+        assert settings is not None
+        conn = _connect(settings)
+    try:
+        cursor = conn.cursor()
+        ensure_schema_and_tables(cursor, schema)
+        conn.commit()
+        prepared = _collapse_scores_if_needed(table, rows)
+        # Dual-write already stamps rows; fill only if the caller omitted it.
+        if not prepared or prepared[0].get(LOAD_DATE_COLUMN) in (None, ""):
+            prepared = stamp_load_date(prepared)
+        sql_fields = _columns(table)
+        copied = _replace_with_rows(
+            cursor,
+            conn,
+            schema=schema,
+            table=table,
+            fieldnames=sql_fields,
+            rows=_iter_row_tuples(prepared, sql_fields, table=table),
+        )
+        if not _enabled_notice_shown:
+            print(f"Azure SQL: {settings_label()}", flush=True)
+            _enabled_notice_shown = True
+        print(f"  SQL [{schema}].[{table}]: {copied} rows", flush=True)
+        return copied
+    finally:
+        if own_connection:
+            conn.close()
+
+
+def settings_label() -> str:
+    """Return server/database for logs (never the password)."""
+    settings = _sql_env()
+    if settings is None:
+        return "unconfigured"
+    return f"{settings['AZURE_SQL_SERVER']}/{settings['AZURE_SQL_DATABASE']}"
+
+
+def latest_table_date(table: str) -> str:
+    """Return the latest date in an active-country fact table."""
+    if table not in _DATE_INDEXED:
+        raise ValueError(f"{table!r} is not a date-indexed fact table.")
+    schema = active_country().slug
+    with sql_connection() as conn:
+        if conn is None:
+            raise RuntimeError("Azure SQL must be configured for cloud execution.")
+        cursor = conn.cursor()
+        ensure_schema_and_tables(cursor, schema)
+        conn.commit()
+        cursor.execute(f"SELECT MAX([date]) FROM {_qualified(schema, table)}")
+        row = cursor.fetchone()
+    value = None if row is None else row[0]
+    if value is None:
+        raise RuntimeError(
+            f"[{schema}].[{table}] has no dated rows. Run a full CLI load first."
+        )
+    return _as_date(value).isoformat()
+
+
+def read_rows_before(table: str, before_date: str) -> list[dict[str, Any]]:
+    """Read rows older than a date for a safe full-table cloud replacement."""
+    if table not in _DATE_INDEXED:
+        raise ValueError(f"{table!r} is not a date-indexed fact table.")
+    schema = active_country().slug
+    fields = _grain_columns(table)
+    columns = ", ".join(f"[{name}]" for name in fields)
+    with sql_connection() as conn:
+        if conn is None:
+            raise RuntimeError("Azure SQL must be configured for cloud execution.")
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {columns} FROM {_qualified(schema, table)} WHERE [date] < ?",
+            (before_date,),
+        )
+        rows = cursor.fetchall()
+    return [dict(zip(fields, row, strict=True)) for row in rows]
+
+
+def rebuild_dimensions_from_sql() -> None:
+    """Replace shared dimensions from distinct keys in both SQL fact tables."""
+    schema = active_country().slug
+    dimensions = {
+        "dim_date": "date",
+        "dim_topic": "topic",
+        "dim_platform": "platform",
+    }
+    with sql_connection() as conn:
+        if conn is None:
+            raise RuntimeError("Azure SQL must be configured for cloud execution.")
+        cursor = conn.cursor()
+        ensure_schema_and_tables(cursor, schema)
+        conn.commit()
+        for table, column in dimensions.items():
+            cursor.execute(
+                f"""
+                SELECT [{column}]
+                FROM {_qualified(schema, _SCORES_TABLE)}
+                WHERE [{column}] IS NOT NULL
+                UNION
+                SELECT [{column}]
+                FROM {_qualified(schema, "fact_raw_citations")}
+                WHERE [{column}] IS NOT NULL
+                """
+            )
+            rows = [{column: row[0]} for row in cursor.fetchall()]
+            rows.sort(key=lambda row: str(row[column]))
+            replace_table(table, rows, [column], conn=conn)
+
+
+def load_country_csvs(data_folder: Path, schema: str, conn) -> None:
+    """Replace every present CSV in data/{country}/ into that SQL schema."""
+    cursor = conn.cursor()
+    ensure_schema_and_tables(cursor, schema)
+    conn.commit()
+    loaded = 0
+    load_at = load_now()
+    for table in TABLES:
+        path = data_folder / f"{table}.csv"
+        if not path.is_file():
+            print(f"  skip [{schema}].[{table}] (no {path.name})")
+            continue
+        fieldnames = _columns(table)
+        started = perf_counter()
+        # Scores must be collapsed in memory; other tables stream from disk.
+        if table == _SCORES_TABLE:
+            with path.open(newline="", encoding="utf-8") as file:
+                dict_rows = list(csv.DictReader(file))
+            source_rows = stamp_load_date(
+                _collapse_scores_if_needed(table, dict_rows), when=load_at
+            )
+            source = _iter_row_tuples(source_rows, fieldnames, table=table)
+        else:
+            source = _iter_csv_tuples(path, fieldnames, table=table, load_at=load_at)
+        copied = _replace_with_rows(
+            cursor,
+            conn,
+            schema=schema,
+            table=table,
+            fieldnames=fieldnames,
+            rows=source,
+        )
+        _rewrite_csv_load_date(path, table, load_at)
+        seconds = perf_counter() - started
+        print(
+            f"  SQL [{schema}].[{table}]: {copied} rows from {path.name} "
+            f"({seconds:.1f}s)",
+            flush=True,
+        )
+        loaded += 1
+    if not loaded:
+        print(f"  No CSVs found in {data_folder}")
+
+
+def try_replace_table(
+    table: str, rows: list[dict[str, Any]], fieldnames: list[str]
+) -> None:
+    """Replace a SQL table after a CSV write; no-op when SQL is skipped."""
+    replace_table(table, rows, fieldnames)
+
+
+# CLI
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Create schemas/tables and load existing country CSVs into Azure SQL."""
+    parser = argparse.ArgumentParser(
+        description="Load data/{country} CSVs into Azure SQL schemas."
+    )
+    add_country_option(parser)
+    parser.add_argument(
+        "--ensure-only",
+        action="store_true",
+        help="Create schemas and empty tables; do not load CSVs.",
+    )
+    args = parser.parse_args(argv)
+    if skip_sql():
+        raise SystemExit("AZURE_SQL_SKIP is set; unset it to load Azure SQL.")
+    if _sql_env() is None:
+        raise SystemExit(
+            "Azure SQL settings are missing from .env "
+            "(AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, "
+            "AZURE_SQL_PASSWORD)."
+        )
+
+    print(f"Azure SQL: {settings_label()}", flush=True)
+    with sql_connection() as conn:
+        if conn is None:
+            raise SystemExit("Could not open an Azure SQL connection.")
+        for country in countries_from_args(args):
+            select_country(country.slug)
+            print(f"=== {country.name} (schema {country.slug}) ===", flush=True)
+            if args.ensure_only:
+                cursor = conn.cursor()
+                ensure_schema_and_tables(cursor, country.slug)
+                conn.commit()
+                print(f"  Ensured schema [{country.slug}] and tables.")
+                continue
+            load_country_csvs(country.data_dir, country.slug, conn)
+
+
+if __name__ == "__main__":
+    main()

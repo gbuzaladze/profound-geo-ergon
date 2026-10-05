@@ -1,0 +1,14 @@
+# Azure Developer CLI service manifest. `azd provision` deploys infra/main.bicep,
+# and `azd deploy` packages this repository as a Python Azure Function.
+name: novartis-geo-pipeline
+metadata:
+  template: novartis-geo-pipeline@0.1.0
+infra:
+  provider: bicep
+  path: infra
+services:
+  # The service name matches the SERVICE_PIPELINE_RESOURCE_NAME Bicep output.
+  pipeline:
+    project: .
+    language: py
+    host: function

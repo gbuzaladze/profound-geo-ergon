@@ -1,0 +1,24 @@
+# Source-control metadata, local environments, and caches
+.git/
+.github/
+.azure/
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.env
+local.settings.json
+
+# Local data, tests, infrastructure, and documentation are not needed by the
+# deployed Function App package.
+local.settings.example.json
+data/
+dashboard/
+scripts/
+sql/
+power bi/
+tests/
+infra/
+uv.lock
+README.md

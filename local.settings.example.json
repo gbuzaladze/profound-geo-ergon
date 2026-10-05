@@ -1,0 +1,14 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "DURABLE_TASK_SCHEDULER_CONNECTION_STRING": "Endpoint=http://localhost:8080;TaskHub=default;Authentication=None",
+    "PIPELINE_TIMER_SCHEDULE": "0 0 * * * *",
+    "PROFOUND_API_KEY": "",
+    "AZURE_SQL_SERVER": "",
+    "AZURE_SQL_DATABASE": "",
+    "AZURE_SQL_USERNAME": "",
+    "AZURE_SQL_PASSWORD": ""
+  }
+}
