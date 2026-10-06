@@ -1,13 +1,13 @@
-"""Load pipeline tables into Azure SQL (one schema per country slug).
+"""Load pipeline tables into the single dbo schema.
 
-Exports still write CSVs; this module then replaces `{slug}.{table}` with a
-truncate + bulk copy. `load_date` is America/Toronto wall time (DATETIME2,
-no offset). Citations have no primary key (duplicate rows are valid). Scores
-collapse case-variant asset names before insert because Azure SQL collation
-is case-insensitive.
+Both Profound categories write the same dbo tables. A category export replaces
+only the rows for its own regions; the other category stays. Dimension tables
+are rebuilt from both facts. `load_date` is America/Toronto wall time
+(DATETIME2, no offset). Citations have no primary key (duplicate rows are
+valid). Scores collapse case-variant asset names before insert because Azure
+SQL collation is case-insensitive.
 
-    python -m pipeline.db              # load existing CSVs
-    python -m pipeline.db --country SLUG
+    python -m pipeline.db              # load combined data/*.csv into dbo
     python -m pipeline.db --ensure-only
 """
 
@@ -28,13 +28,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from mssql_python import connect
 
-from pipeline.config import (
-    active_country,
-    add_country_option,
-    countries_from_args,
-    project_root,
-    select_country,
-)
+from pipeline.config import active_country, project_root
 
 # Bulk copy: 5k rows per TDS batch; 1 hour covers the large citation CSVs.
 _BULK_BATCH_SIZE = 5000
@@ -61,6 +55,10 @@ _FLOAT_COLUMNS = frozenset(
 )
 
 _SCORES_TABLE = "fact_scores_summarized"
+# Both categories share dbo. Country is the region column, not a schema.
+SQL_SCHEMA = "dbo"
+# Category exports replace their own slice. Dimension tables are a full rebuild.
+_SLICE_TABLES = frozenset({_SCORES_TABLE, "fact_raw_citations", "dim_prompt"})
 LOAD_DATE_COLUMN = "load_date"
 _LOAD_DATE_DDL = (LOAD_DATE_COLUMN, "DATETIME2 NOT NULL")
 LOAD_TZ = ZoneInfo("America/Toronto")
@@ -259,7 +257,7 @@ def _table_column_sql(table: str) -> str:
 
 
 def ensure_schema_and_tables(cursor, schema: str) -> None:
-    """Create the country schema and the six reporting tables if they are missing.
+    """Create the schema, if needed, and the reporting tables when they are missing.
 
     Existing tables are not rebuilt, except `fact_raw_citations` when
     `subcategory` and `pag` are missing or not immediately after `category`.
@@ -366,6 +364,28 @@ def _columns_match(actual: list[str], desired: list[str]) -> bool:
     return [name.casefold() for name in actual] == [name.casefold() for name in desired]
 
 
+def _stage_reordered_table(cursor, schema: str, table: str) -> tuple[str, str]:
+    """Create an empty copy of `table` in the current column order.
+
+    Returns the staging name and its qualified identifier. The caller copies
+    rows, then `_swap_reordered_table` replaces the original.
+    """
+    staging = f"{table}__reorder"
+    qualified_stage = _qualified(schema, staging)
+    cursor.execute(
+        f"IF OBJECT_ID(N'{schema}.{staging}', N'U') IS NOT NULL "
+        f"DROP TABLE {qualified_stage}"
+    )
+    cursor.execute(f"CREATE TABLE {qualified_stage} ({_table_column_sql(table)})")
+    return staging, qualified_stage
+
+
+def _swap_reordered_table(cursor, schema: str, table: str, staging: str) -> None:
+    """Drop the original table and rename the staged copy into its place."""
+    cursor.execute(f"DROP TABLE {_qualified(schema, table)}")
+    cursor.execute(f"EXEC sp_rename N'{schema}.{staging}', N'{table}'")
+
+
 def _ensure_citation_class_columns(cursor, schema: str) -> None:
     """Put subcategory and pag immediately after category on an existing table.
 
@@ -378,15 +398,7 @@ def _ensure_citation_class_columns(cursor, schema: str) -> None:
     actual = _table_column_names(cursor, schema, table)
     if _columns_match(actual, desired):
         return
-    staging = f"{table}__reorder"
-    qualified_stage = _qualified(schema, staging)
-    cursor.execute(
-        f"IF OBJECT_ID(N'{schema}.{staging}', N'U') IS NOT NULL "
-        f"DROP TABLE {qualified_stage}"
-    )
-    cursor.execute(
-        f"CREATE TABLE {qualified_stage} ({_table_column_sql(table)})"
-    )
+    staging, qualified_stage = _stage_reordered_table(cursor, schema, table)
     present = {name.casefold() for name in actual}
     shared = [name for name in desired if name.casefold() in present]
     if shared:
@@ -395,8 +407,7 @@ def _ensure_citation_class_columns(cursor, schema: str) -> None:
             f"INSERT INTO {qualified_stage} ({cols}) "
             f"SELECT {cols} FROM {_qualified(schema, table)}"
         )
-    cursor.execute(f"DROP TABLE {_qualified(schema, table)}")
-    cursor.execute(f"EXEC sp_rename N'{schema}.{staging}', N'{table}'")
+    _swap_reordered_table(cursor, schema, table, staging)
 
 
 # Value conversion
@@ -679,6 +690,71 @@ def _rewrite_csv_load_date(path: Path, table: str, load_at: datetime) -> None:
     temp_path.replace(path)
 
 
+def _category_regions() -> list[str]:
+    """Return the countries named on the active Profound category."""
+    country = active_country()
+    if not country.regions:
+        raise SystemExit(f"{country.slug} has no regions in its name.")
+    return list(country.regions)
+
+
+def _placeholders(count: int) -> str:
+    """Comma-separated parameter markers for an IN list."""
+    return ", ".join("?" for _ in range(count))
+
+
+def _apply_staged_rows(
+    cursor,
+    *,
+    table: str,
+    qualified: str,
+    qualified_stage: str,
+    columns: str,
+    mode: str,
+) -> None:
+    """Move staged rows onto the target, either for one category or the whole table."""
+    if mode == "replace":
+        cursor.execute(f"TRUNCATE TABLE {qualified}")
+    elif mode == "slice" and table == "dim_prompt":
+        # Prompt regions are a pipe-joined list, so this category is matched
+        # by those tokens. Prompts for the other category stay.
+        cursor.execute(
+            f"""
+            DELETE target
+            FROM {qualified} AS target
+            WHERE EXISTS (
+                SELECT 1
+                FROM STRING_SPLIT(target.[regions], '|') AS existing_region
+                WHERE LTRIM(RTRIM(existing_region.value)) <> ''
+                  AND LTRIM(RTRIM(existing_region.value)) IN (
+                      SELECT LTRIM(RTRIM(incoming_region.value))
+                      FROM {qualified_stage} AS staged
+                      CROSS APPLY STRING_SPLIT(staged.[regions], '|') AS incoming_region
+                      WHERE LTRIM(RTRIM(incoming_region.value)) <> ''
+                  )
+            )
+            """
+        )
+    elif mode == "slice":
+        cursor.execute(
+            f"""
+            DELETE target
+            FROM {qualified} AS target
+            WHERE target.[region] IN (
+                SELECT DISTINCT staged.[region]
+                FROM {qualified_stage} AS staged
+                WHERE staged.[region] IS NOT NULL
+                  AND LTRIM(RTRIM(staged.[region])) <> ''
+            )
+            """
+        )
+    else:
+        raise ValueError(f"Unknown SQL replace mode {mode!r}.")
+    cursor.execute(
+        f"INSERT INTO {qualified} ({columns}) SELECT {columns} FROM {qualified_stage}"
+    )
+
+
 def _replace_with_rows(
     cursor,
     conn,
@@ -687,8 +763,9 @@ def _replace_with_rows(
     table: str,
     fieldnames: list[str],
     rows: Iterable[tuple[object, ...]],
+    mode: str = "replace",
 ) -> int:
-    """Stage rows, then atomically replace the target. Returns rows copied."""
+    """Stage rows, then atomically merge or replace the target. Returns rows copied."""
     qualified = _qualified(schema, table)
     stage = f"__stage_{table}_{uuid4().hex}"
     qualified_stage = _qualified(schema, stage)
@@ -707,10 +784,13 @@ def _replace_with_rows(
             keep_nulls=True,
         )
         copied = int(result.get("rows_copied") or 0)
-        cursor.execute(f"TRUNCATE TABLE {qualified}")
-        cursor.execute(
-            f"INSERT INTO {qualified} ({columns}) "
-            f"SELECT {columns} FROM {qualified_stage}"
+        _apply_staged_rows(
+            cursor,
+            table=table,
+            qualified=qualified,
+            qualified_stage=qualified_stage,
+            columns=columns,
+            mode=mode,
         )
         cursor.execute(f"DROP TABLE {qualified_stage}")
         conn.commit()
@@ -725,6 +805,11 @@ def _replace_with_rows(
         raise
 
 
+def sql_is_configured() -> bool:
+    """True when this process should write Azure SQL."""
+    return not skip_sql() and _sql_env() is not None
+
+
 def replace_table(
     table: str,
     rows: list[dict[str, Any]],
@@ -732,15 +817,18 @@ def replace_table(
     *,
     conn=None,
 ) -> int | None:
-    """Replace one table in the active country's schema. None if SQL is skipped."""
+    """Merge one category into dbo, or replace a dimension table.
+
+    Returns rows copied, or None when SQL is skipped.
+    """
     global _skip_notice_shown, _enabled_notice_shown
-    if skip_sql() or _sql_env() is None:
+    if not sql_is_configured():
         if not _skip_notice_shown:
             print("Azure SQL is not configured; writing CSVs only.")
             _skip_notice_shown = True
         return None
 
-    schema = active_country().slug
+    schema = SQL_SCHEMA
     if table not in TABLES:
         raise SystemExit(f"Unknown SQL table {table!r}.")
     grain = _grain_columns(table)
@@ -771,6 +859,7 @@ def replace_table(
             table=table,
             fieldnames=sql_fields,
             rows=_iter_row_tuples(prepared, sql_fields, table=table),
+            mode="slice" if table in _SLICE_TABLES else "replace",
         )
         if not _enabled_notice_shown:
             print(f"Azure SQL: {settings_label()}", flush=True)
@@ -791,31 +880,42 @@ def settings_label() -> str:
 
 
 def latest_table_date(table: str) -> str:
-    """Return the latest date in an active-country fact table."""
+    """Return the latest date for the active category's regions in dbo."""
     if table not in _DATE_INDEXED:
         raise ValueError(f"{table!r} is not a date-indexed fact table.")
-    schema = active_country().slug
+    regions = _category_regions()
+    placeholders = _placeholders(len(regions))
     with sql_connection() as conn:
         if conn is None:
             raise RuntimeError("Azure SQL must be configured for cloud execution.")
         cursor = conn.cursor()
-        ensure_schema_and_tables(cursor, schema)
+        ensure_schema_and_tables(cursor, SQL_SCHEMA)
         conn.commit()
-        cursor.execute(f"SELECT MAX([date]) FROM {_qualified(schema, table)}")
+        cursor.execute(
+            f"""
+            SELECT MAX([date])
+            FROM {_qualified(SQL_SCHEMA, table)}
+            WHERE [region] IN ({placeholders})
+            """,
+            tuple(regions),
+        )
         row = cursor.fetchone()
     value = None if row is None else row[0]
     if value is None:
+        names = ", ".join(regions)
         raise RuntimeError(
-            f"[{schema}].[{table}] has no dated rows. Run a full CLI load first."
+            f"[{SQL_SCHEMA}].[{table}] has no dated rows for {names}. "
+            "Run a full CLI load first."
         )
     return _as_date(value).isoformat()
 
 
 def read_rows_before(table: str, before_date: str) -> list[dict[str, Any]]:
-    """Read rows older than a date for a safe full-table cloud replacement."""
+    """Read this category's rows older than a date from the combined dbo table."""
     if table not in _DATE_INDEXED:
         raise ValueError(f"{table!r} is not a date-indexed fact table.")
-    schema = active_country().slug
+    regions = _category_regions()
+    placeholders = _placeholders(len(regions))
     fields = _grain_columns(table)
     columns = ", ".join(f"[{name}]" for name in fields)
     with sql_connection() as conn:
@@ -823,31 +923,34 @@ def read_rows_before(table: str, before_date: str) -> list[dict[str, Any]]:
             raise RuntimeError("Azure SQL must be configured for cloud execution.")
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT {columns} FROM {_qualified(schema, table)} WHERE [date] < ?",
-            (before_date,),
+            f"""
+            SELECT {columns}
+            FROM {_qualified(SQL_SCHEMA, table)}
+            WHERE [date] < ? AND [region] IN ({placeholders})
+            """,
+            (before_date, *regions),
         )
         rows = cursor.fetchall()
     return [dict(zip(fields, row, strict=True)) for row in rows]
 
 
 def rebuild_dimensions_from_sql() -> None:
-    """Replace shared dimensions from distinct keys in both SQL fact tables."""
-    schema = active_country().slug
+    """Replace shared dimensions from distinct keys in both dbo fact tables."""
     with sql_connection() as conn:
         if conn is None:
             raise RuntimeError("Azure SQL must be configured for cloud execution.")
         cursor = conn.cursor()
-        ensure_schema_and_tables(cursor, schema)
+        ensure_schema_and_tables(cursor, SQL_SCHEMA)
         conn.commit()
         for table, column in _SLICER_DIMENSIONS.items():
             cursor.execute(
                 f"""
                 SELECT [{column}]
-                FROM {_qualified(schema, _SCORES_TABLE)}
+                FROM {_qualified(SQL_SCHEMA, _SCORES_TABLE)}
                 WHERE [{column}] IS NOT NULL
                 UNION
                 SELECT [{column}]
-                FROM {_qualified(schema, "fact_raw_citations")}
+                FROM {_qualified(SQL_SCHEMA, "fact_raw_citations")}
                 WHERE [{column}] IS NOT NULL
                 """
             )
@@ -856,17 +959,17 @@ def rebuild_dimensions_from_sql() -> None:
             replace_table(table, rows, [column], conn=conn)
 
 
-def load_country_csvs(data_folder: Path, schema: str, conn) -> None:
-    """Replace every present CSV in data/{country}/ into that SQL schema."""
+def load_csvs(data_folder: Path, conn) -> None:
+    """Replace every present CSV in data/ into the dbo tables."""
     cursor = conn.cursor()
-    ensure_schema_and_tables(cursor, schema)
+    ensure_schema_and_tables(cursor, SQL_SCHEMA)
     conn.commit()
     loaded = 0
     load_at = load_now()
     for table in TABLES:
         path = data_folder / f"{table}.csv"
         if not path.is_file():
-            print(f"  skip [{schema}].[{table}] (no {path.name})")
+            print(f"  skip [{SQL_SCHEMA}].[{table}] (no {path.name})")
             continue
         fieldnames = _columns(table)
         started = perf_counter()
@@ -883,15 +986,16 @@ def load_country_csvs(data_folder: Path, schema: str, conn) -> None:
         copied = _replace_with_rows(
             cursor,
             conn,
-            schema=schema,
+            schema=SQL_SCHEMA,
             table=table,
             fieldnames=fieldnames,
             rows=source,
+            mode="replace",
         )
         _rewrite_csv_load_date(path, table, load_at)
         seconds = perf_counter() - started
         print(
-            f"  SQL [{schema}].[{table}]: {copied} rows from {path.name} "
+            f"  SQL [{SQL_SCHEMA}].[{table}]: {copied} rows from {path.name} "
             f"({seconds:.1f}s)",
             flush=True,
         )
@@ -903,7 +1007,7 @@ def load_country_csvs(data_folder: Path, schema: str, conn) -> None:
 def try_replace_table(
     table: str, rows: list[dict[str, Any]], fieldnames: list[str]
 ) -> None:
-    """Replace a SQL table after a CSV write; no-op when SQL is skipped."""
+    """Write one table to Azure SQL after a CSV export; no-op when SQL is skipped."""
     replace_table(table, rows, fieldnames)
 
 
@@ -911,15 +1015,14 @@ def try_replace_table(
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Create schemas/tables and load existing country CSVs into Azure SQL."""
+    """Create the dbo tables and load combined data/*.csv into Azure SQL."""
     parser = argparse.ArgumentParser(
-        description="Load data/{country} CSVs into Azure SQL schemas."
+        description="Load combined data/*.csv files into the dbo schema."
     )
-    add_country_option(parser)
     parser.add_argument(
         "--ensure-only",
         action="store_true",
-        help="Create schemas and empty tables; do not load CSVs.",
+        help="Create dbo tables; do not load CSVs.",
     )
     args = parser.parse_args(argv)
     if skip_sql():
@@ -935,16 +1038,14 @@ def main(argv: list[str] | None = None) -> None:
     with sql_connection() as conn:
         if conn is None:
             raise SystemExit("Could not open an Azure SQL connection.")
-        for country in countries_from_args(args):
-            select_country(country.slug)
-            print(f"=== {country.name} (schema {country.slug}) ===", flush=True)
-            if args.ensure_only:
-                cursor = conn.cursor()
-                ensure_schema_and_tables(cursor, country.slug)
-                conn.commit()
-                print(f"  Ensured schema [{country.slug}] and tables.")
-                continue
-            load_country_csvs(country.data_dir, country.slug, conn)
+        print("=== dbo ===", flush=True)
+        if args.ensure_only:
+            cursor = conn.cursor()
+            ensure_schema_and_tables(cursor, SQL_SCHEMA)
+            conn.commit()
+            print("  Ensured schema [dbo] and tables.")
+            return
+        load_csvs(project_root() / "data", conn)
 
 
 if __name__ == "__main__":

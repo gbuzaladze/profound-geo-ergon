@@ -27,10 +27,10 @@ from pipeline.common import (
     append_csv,
     profound_client,
     rate_limiter,
+    publish_table,
     read_csv,
     ref_name,
     write_csv,
-    write_csv_and_sql,
 )
 from pipeline.combine import combine_category_exports
 from pipeline.config import (
@@ -47,7 +47,7 @@ from pipeline.config import (
     project_root,
     select_country,
 )
-from pipeline.dims import write_dims
+from pipeline.dims import publish_dimensions
 
 
 def output_path() -> Path:
@@ -616,11 +616,7 @@ def _restore_category_citations() -> None:
     combined = project_root() / "data" / "fact_raw_citations.csv"
     if not combined.is_file():
         return
-    regions = {
-        part.strip()
-        for part in active_country().name.split(",")
-        if part.strip()
-    }
+    regions = set(active_country().regions)
     with combined.open(newline="", encoding="utf-8") as file:
         reader = csv.DictReader(file)
         fieldnames = list(reader.fieldnames or [])
@@ -732,22 +728,14 @@ def export(
         rows, live_from=start if resolved == "incremental" else None
     )
     rows.sort(key=sort_key)
-    if csv_output:
-        destination = str(
-            write_csv_and_sql(rows, path=output_path(), fieldnames=FIELDNAMES)
-        )
-    else:
-        from pipeline.db import replace_table
-
-        replace_table("fact_raw_citations", rows, FIELDNAMES)
-        destination = "Azure SQL"
+    destination = publish_table(
+        rows,
+        path=output_path(),
+        fieldnames=FIELDNAMES,
+        csv_output=csv_output,
+    )
     if rebuild_dimensions:
-        if csv_output:
-            write_dims()
-        else:
-            from pipeline.db import rebuild_dimensions_from_sql
-
-            rebuild_dimensions_from_sql()
+        publish_dimensions(csv_output=csv_output)
     if resolved == "full":
         # Checkpoint is only for a paused backfill; incremental has no partial file.
         clear_checkpoint()
@@ -768,6 +756,13 @@ def export(
         "start": start,
         "end": scan_end,
     }
+
+
+def _author_fill_summary(counts: dict[str, dict[str, int]]) -> str:
+    """Format filled/total author counts for the enrichment log line."""
+    return ", ".join(
+        f"{name} {stats['filled']}/{stats['rows']}" for name, stats in counts.items()
+    )
 
 
 def _author_fill_counts(rows: list[dict[str, object]]) -> dict[str, dict[str, int]]:
@@ -805,30 +800,18 @@ def enrich_authors_existing() -> dict[str, object]:
     print(f"Reading {path}", flush=True)
     rows: list[dict[str, object]] = list(read_csv(path))
     before = _author_fill_counts(rows)
-    print(
-        "Author fill before: "
-        + ", ".join(
-            f"{name} {stats['filled']}/{stats['rows']}" for name, stats in before.items()
-        ),
-        flush=True,
-    )
+    print(f"Author fill before: {_author_fill_summary(before)}", flush=True)
 
     rows = apply_authors(rows)
     after = _author_fill_counts(rows)
-    print(
-        "Author fill after: "
-        + ", ".join(
-            f"{name} {stats['filled']}/{stats['rows']}" for name, stats in after.items()
-        ),
-        flush=True,
-    )
+    print(f"Author fill after: {_author_fill_summary(after)}", flush=True)
 
     rows = apply_category_rules(rows)
     rows.sort(key=sort_key)
-    destination = str(
-        write_csv_and_sql(rows, path=path, fieldnames=FIELDNAMES)
+    destination = publish_table(
+        rows, path=path, fieldnames=FIELDNAMES, csv_output=True
     )
-    write_dims()
+    publish_dimensions(csv_output=True)
     minutes = (perf_counter() - started) / 60
     print(f"Author enrichment written to {destination}: {len(rows)} rows")
     print(f"Runtime: {minutes:.1f} minutes")

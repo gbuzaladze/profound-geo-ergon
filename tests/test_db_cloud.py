@@ -94,6 +94,26 @@ class AtomicReplacementTests(unittest.TestCase):
         self.assertNotIn("TRUNCATE TABLE [europe-asia].[dim_date]", cursor.events)
         self.assertEqual(connection.rollbacks, 1)
 
+    def test_category_slice_deletes_only_staged_regions(self) -> None:
+        cursor = FakeCursor()
+        connection = FakeConnection()
+
+        _replace_with_rows(
+            cursor,
+            connection,
+            schema="dbo",
+            table="fact_scores_summarized",
+            fieldnames=["date", "region", "load_date"],
+            rows=[("2026-09-14", "Germany", "2026-09-15")],
+            mode="slice",
+        )
+
+        statements = " ".join(cursor.events)
+        self.assertNotIn("TRUNCATE TABLE", statements)
+        self.assertIn("DELETE target", statements)
+        self.assertIn("target.[region] IN", statements)
+        self.assertIn("INSERT INTO [dbo].[fact_scores_summarized]", statements)
+
 
 if __name__ == "__main__":
     unittest.main()

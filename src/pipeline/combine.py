@@ -11,19 +11,16 @@ from __future__ import annotations
 import csv
 import shutil
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
-from pipeline.common import write_csv
+from pipeline.common import replace_file, write_csv
 from pipeline.config import COUNTRIES, project_root
+from pipeline.dims import DIM_COLUMNS, collect_dim_keys
 
 SCORE_FILE = "fact_scores_summarized.csv"
 CITATION_FILE = "fact_raw_citations.csv"
-DIM_FILES = (
-    ("dim_date.csv", "date"),
-    ("dim_topic.csv", "topic"),
-    ("dim_platform.csv", "platform"),
-    ("dim_region.csv", "region"),
-)
 
 
 def combined_dir() -> Path:
@@ -31,17 +28,18 @@ def combined_dir() -> Path:
     return project_root() / "data"
 
 
-def _publish_csv(temp_path: Path, destination: Path) -> Path:
-    """Replace destination with the temp CSV. If the target is open, keep the temp."""
-    try:
-        temp_path.replace(destination)
-    except PermissionError:
-        print(
-            f"Could not replace {destination} (file is open). "
-            f"Left new export at {temp_path}."
-        )
-        return temp_path
-    return destination
+@contextmanager
+def _open_csv_destination(
+    destination: Path, fieldnames: list[str]
+) -> Iterator[csv.DictWriter]:
+    """Write a temp CSV, then replace the destination unless that file is open."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(destination.stem + ".tmp.csv")
+    with temp_path.open("w", newline="", encoding="utf-8") as out_file:
+        writer = csv.DictWriter(out_file, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        yield writer
+    replace_file(temp_path, destination)
 
 
 def _header(path: Path) -> list[str]:
@@ -65,30 +63,14 @@ def concat_csvs(sources: list[Path], destination: Path) -> int:
                 f"{path.name} columns {header} do not match {sources[0].name}."
             )
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(destination.stem + ".tmp.csv")
     written = 0
-    with temp_path.open("w", newline="", encoding="utf-8") as out_file:
-        writer = csv.DictWriter(out_file, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
+    with _open_csv_destination(destination, fieldnames) as writer:
         for path in sources:
             with path.open(newline="", encoding="utf-8") as in_file:
                 for row in csv.DictReader(in_file):
                     writer.writerow(row)
                     written += 1
-    _publish_csv(temp_path, destination)
     return written
-
-
-def _union_column(sources: list[Path], column: str) -> list[str]:
-    values: set[str] = set()
-    for path in sources:
-        with path.open(newline="", encoding="utf-8") as file:
-            for row in csv.DictReader(file):
-                value = str(row.get(column) or "").strip()
-                if value:
-                    values.add(value)
-    return sorted(values)
 
 
 def _regions_in(paths: list[Path]) -> set[str]:
@@ -110,12 +92,8 @@ def _write_merged_fact(
     A blank region is not treated as a refreshed country, so those rows stay.
     """
     fieldnames = _header(sources[0])
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(destination.stem + ".tmp.csv")
     written = 0
-    with temp_path.open("w", newline="", encoding="utf-8") as out_file:
-        writer = csv.DictWriter(out_file, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
+    with _open_csv_destination(destination, fieldnames) as writer:
         if destination.is_file():
             with destination.open(newline="", encoding="utf-8") as existing:
                 for row in csv.DictReader(existing):
@@ -129,7 +107,6 @@ def _write_merged_fact(
                 for row in csv.DictReader(in_file):
                     writer.writerow(row)
                     written += 1
-    _publish_csv(temp_path, destination)
     return written
 
 
@@ -201,11 +178,14 @@ def combine_category_exports() -> Path | None:
         for path in (folder / SCORE_FILE, folder / CITATION_FILE)
         if path.is_file()
     ]
-    for filename, column in DIM_FILES:
-        values = _union_column(fact_paths, column)
-        dim_path = folder / filename
-        written = concat_csvs_from_rows(
-            dim_path, [column], [{column: value} for value in values]
+    keys = collect_dim_keys(fact_paths)
+    for column in DIM_COLUMNS:
+        values = sorted(keys[column])
+        dim_path = folder / f"dim_{column}.csv"
+        written = write_csv(
+            [{column: value} for value in values],
+            path=dim_path,
+            fieldnames=[column],
         )
         print(f"  {written.name}: {len(values)}")
 
@@ -215,10 +195,3 @@ def combine_category_exports() -> Path | None:
         _remove_tree(legacy)
         print(f"Removed {legacy}")
     return destination
-
-
-def concat_csvs_from_rows(
-    destination: Path, fieldnames: list[str], rows: list[dict[str, str]]
-) -> Path:
-    """Write a small CSV, replacing the target unless it is open."""
-    return write_csv(rows, path=destination, fieldnames=fieldnames)

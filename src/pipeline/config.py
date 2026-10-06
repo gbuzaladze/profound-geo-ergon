@@ -112,7 +112,9 @@ def _as_slug(value: object, key: str) -> str:
 
 @dataclass(frozen=True)
 class Country:
-    """One Profound category exported into data/{slug}/ and schema {slug}.
+    """One Profound category exported into data/{slug}/.
+
+    Both categories load into schema dbo. Country is the region column.
 
     `owned_asset` is the Profound brand name used for dashboard KPIs. A
     country may override the project default when Profound uses a local name.
@@ -128,8 +130,13 @@ class Country:
         return project_root() / "data" / self.slug
 
     @property
-    def dashboard_dir(self) -> Path:
-        return project_root() / "dashboard" / self.slug
+    def regions(self) -> tuple[str, ...]:
+        """Regions covered by this category.
+
+        `name` is a comma-separated country list. Those values are the
+        `region` column used to merge one category into the combined export.
+        """
+        return tuple(part.strip() for part in self.name.split(",") if part.strip())
 
 
 def _load_countries(raw: object, default_owned_asset: str) -> tuple[Country, ...]:

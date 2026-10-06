@@ -15,7 +15,7 @@ import profound
 from profound import Profound
 
 from pipeline.combine import combine_category_exports
-from pipeline.common import call_api, profound_client, ref_name, write_csv_and_sql
+from pipeline.common import call_api, profound_client, publish_table, ref_name
 from pipeline.config import (
     START_DATE,
     TOP_N,
@@ -32,7 +32,7 @@ from pipeline.config import (
     select_country,
 )
 from pipeline.db import dedupe_score_rows
-from pipeline.dims import write_dims
+from pipeline.dims import publish_dimensions
 
 # Summarized visibility pages are smaller than prompt lists.
 PAGE_SIZE = 50
@@ -613,26 +613,14 @@ def export(
         print(f"Collapsed case-variant assets: {before_collapse} -> {len(rows)} rows")
 
     rows.sort(key=score_key)
-    if csv_output:
-        destination = str(
-            write_csv_and_sql(
-                rows,
-                path=data_dir() / "fact_scores_summarized.csv",
-                fieldnames=FIELDNAMES,
-            )
-        )
-    else:
-        from pipeline.db import replace_table
-
-        replace_table("fact_scores_summarized", rows, FIELDNAMES)
-        destination = "Azure SQL"
+    destination = publish_table(
+        rows,
+        path=data_dir() / "fact_scores_summarized.csv",
+        fieldnames=FIELDNAMES,
+        csv_output=csv_output,
+    )
     if rebuild_dimensions:
-        if csv_output:
-            write_dims()
-        else:
-            from pipeline.db import rebuild_dimensions_from_sql
-
-            rebuild_dimensions_from_sql()
+        publish_dimensions(csv_output=csv_output)
 
     dates = sorted({str(row["date"]) for row in rows if row.get("date")})
     minutes = (perf_counter() - started) / 60

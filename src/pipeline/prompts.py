@@ -11,7 +11,7 @@ from time import perf_counter
 
 from profound import Profound
 
-from pipeline.common import call_api, profound_client, ref_name, write_csv_and_sql
+from pipeline.common import call_api, profound_client, publish_table, ref_name
 from pipeline.config import (
     add_country_option,
     category_id,
@@ -91,17 +91,12 @@ def export(*, csv_output: bool = True) -> dict[str, object]:
     rows.sort(
         key=lambda row: (str(row.get("topic") or ""), str(row.get("prompt") or ""))
     )
-    if csv_output:
-        destination = str(
-            write_csv_and_sql(
-                rows, path=data_dir() / "dim_prompt.csv", fieldnames=FIELDNAMES
-            )
-        )
-    else:
-        from pipeline.db import replace_table
-
-        replace_table("dim_prompt", rows, FIELDNAMES)
-        destination = "Azure SQL"
+    destination = publish_table(
+        rows,
+        path=data_dir() / "dim_prompt.csv",
+        fieldnames=FIELDNAMES,
+        csv_output=csv_output,
+    )
     minutes = (perf_counter() - started) / 60
     print(f"Prompts table written to {destination}: {len(rows)} rows")
     print(f"Runtime: {minutes:.1f} minutes; API calls: {api_calls}")

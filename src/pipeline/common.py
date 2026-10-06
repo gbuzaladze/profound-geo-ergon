@@ -162,6 +162,21 @@ def write_csv_and_sql(
     return written
 
 
+def replace_file(temp_path: Path, path: Path) -> Path:
+    """Replace `path` with a finished temp file.
+
+    If the target is open in Excel, the temp file is left in place.
+    """
+    try:
+        temp_path.replace(path)
+        return path
+    except PermissionError:
+        print(
+            f"Could not replace {path} (file is open). Left new export at {temp_path}."
+        )
+        return temp_path
+
+
 def write_csv(
     rows: list[dict[str, Any]],
     *,
@@ -171,8 +186,7 @@ def write_csv(
     """Write rows to `path`.
 
     Writes a sibling `.tmp.csv` first, then replaces the target so a crash
-    does not leave a truncated file. If the target is open in Excel, the temp
-    file is left in place instead.
+    does not leave a truncated file.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(path.stem + ".tmp.csv")
@@ -180,15 +194,28 @@ def write_csv(
         writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+    return replace_file(temp_path, path)
 
-    try:
-        temp_path.replace(path)
-        return path
-    except PermissionError:
-        print(
-            f"Could not replace {path} (file is open). Left new export at {temp_path}."
-        )
-        return temp_path
+
+def publish_table(
+    rows: list[dict[str, Any]],
+    *,
+    path: Path,
+    fieldnames: list[str],
+    csv_output: bool,
+) -> str:
+    """Write the table to CSV and SQL, or to SQL only.
+
+    The SQL table name is the CSV stem. Returns the path, or `Azure SQL`
+    when the run does not keep a local file, for the export log line.
+    """
+    if csv_output:
+        return str(write_csv_and_sql(rows, path=path, fieldnames=fieldnames))
+    # Imported here because pipeline.db must not import this module.
+    from pipeline.db import replace_table
+
+    replace_table(path.stem, rows, fieldnames)
+    return "Azure SQL"
 
 
 def append_csv(
