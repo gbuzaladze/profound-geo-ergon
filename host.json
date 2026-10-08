@@ -3,10 +3,10 @@
   "functionTimeout": "04:00:00",
   "extensions": {
     "durableTask": {
-      "hubName": "default",
+      "hubName": "ErgonGeo",
       "storageProvider": {
-        "type": "azureManaged",
-        "connectionStringName": "DURABLE_TASK_SCHEDULER_CONNECTION_STRING"
+        "type": "AzureStorage",
+        "connectionStringName": "AzureWebJobsStorage"
       }
     }
   },

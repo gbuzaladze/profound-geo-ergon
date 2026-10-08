@@ -15,18 +15,21 @@ from pipeline.config import COUNTRIES
 LOGGER = logging.getLogger(__name__)
 TORONTO = ZoneInfo("America/Toronto")
 SCHEDULE_HOUR = 6
+# Novartis runs on Monday; Tuesday keeps the two pipelines off the same day.
+SCHEDULE_WEEKDAY = 1
 
 app = df.DFApp()
 
 
 def scheduled_instance_id(now: datetime) -> str | None:
-    """Return today's deterministic run ID after 6 AM Toronto."""
+    """Return this Tuesday's run ID after 6 AM Toronto."""
     local_now = now.astimezone(TORONTO)
-    if local_now.hour < SCHEDULE_HOUR:
+    # Tuesday is weekday 1. Other days never start a run, even if the timer fires.
+    if local_now.weekday() != SCHEDULE_WEEKDAY or local_now.hour < SCHEDULE_HOUR:
         return None
-    # Durable Functions rejects a duplicate ID, making the date-based name the
-    # final safeguard against more than one run per Toronto calendar day.
-    return f"geo-daily-{local_now.date().isoformat()}"
+    # Durable Functions rejects a duplicate ID, so hourly Tuesday checks still
+    # produce one run for that Toronto date.
+    return f"geo-weekly-{local_now.date().isoformat()}"
 
 
 @app.timer_trigger(
@@ -39,14 +42,14 @@ def scheduled_instance_id(now: datetime) -> str | None:
 async def scheduled_pipeline(
     timer: func.TimerRequest, client: df.DurableOrchestrationClient
 ) -> None:
-    """Start at most one orchestration per Toronto calendar day."""
+    """Start at most one orchestration each Tuesday in Toronto."""
     instance_id = scheduled_instance_id(datetime.now(TORONTO))
     if instance_id is None:
         return
     existing = await client.get_status(instance_id)
     if existing is not None:
         LOGGER.info(
-            "Daily pipeline already exists instance_id=%s status=%s",
+            "Weekly pipeline already exists instance_id=%s status=%s",
             instance_id,
             existing.runtime_status,
         )
@@ -58,7 +61,7 @@ async def scheduled_pipeline(
         client_input={"countries": countries},
     )
     LOGGER.info(
-        "Started daily pipeline instance_id=%s countries=%s past_due=%s",
+        "Started weekly pipeline instance_id=%s countries=%s past_due=%s",
         instance_id,
         countries,
         timer.past_due,

@@ -184,6 +184,33 @@ class ApplyAuthorsTests(unittest.TestCase):
         self.assertEqual(sleeps, [12.0])
         self.assertTrue(all(row["author"] is None for row in rows))
 
+    def test_instagram_stops_at_time_budget(self) -> None:
+        calls: list[str] = []
+        elapsed = [0.0]
+
+        def resolve(shortcode: str) -> str | None:
+            calls.append(shortcode)
+            elapsed[0] += 40.0
+            return f"@{shortcode}"
+
+        rows = [
+            {"url": f"https://www.instagram.com/p/{code}/", "hostname": "instagram.com"}
+            for code in ("aaa", "bbb", "ccc", "aaa")
+        ]
+        apply_authors(
+            rows,
+            live_lookup=True,
+            resolve_instagram=resolve,
+            resolve_youtube=lambda _url: None,
+            delay_seconds=0,
+            instagram_budget=60.0,
+            clock=lambda: elapsed[0],
+        )
+        self.assertEqual(calls, ["aaa", "bbb"])
+        self.assertEqual(
+            [row["author"] for row in rows], ["@aaa", "@bbb", None, "@aaa"]
+        )
+
     def test_incremental_lookup_skips_older_rows(self) -> None:
         calls: list[str] = []
 

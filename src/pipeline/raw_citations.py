@@ -79,8 +79,6 @@ FIELDNAMES = [
     "topic",
     "platform",
     "category",
-    "subcategory",
-    "pag",
     "mentioned",
     "url",
     "hostname",
@@ -188,35 +186,21 @@ def citation_domains_path(slug: str) -> Path:
     return project_root() / "citation-domains" / f"citation-domains-{slug}.csv"
 
 
-def _pag_label(value: object) -> str:
-    """Return TRUE, FALSE, or blank. Blank is not the same as FALSE."""
-    text = str(value or "").strip().casefold()
-    if text == "true":
-        return "TRUE"
-    if text == "false":
-        return "FALSE"
-    return ""
-
-
-def load_citation_domains(slug: str) -> dict[str, tuple[str, str, str]]:
-    """Load domain → (category, subcategory, pag) for one country.
+def load_citation_domains(slug: str) -> dict[str, str]:
+    """Load domain → category for one country.
 
     A missing file means that country has no list yet. Keys use `_domain_key`.
     """
     path = citation_domains_path(slug)
     if not path.is_file():
         return {}
-    table: dict[str, tuple[str, str, str]] = {}
+    table: dict[str, str] = {}
     with path.open(encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
             domain = _domain_key(row.get("domain"))
             if not domain:
                 continue
-            table[domain] = (
-                str(row.get("category") or "").strip(),
-                str(row.get("subcategory") or "").strip(),
-                _pag_label(row.get("pag")),
-            )
+            table[domain] = str(row.get("category") or "").strip()
     return table
 
 
@@ -233,19 +217,13 @@ def citation_row(
     tags: object,
     region: object,
 ) -> dict[str, object]:
-    """Build one export row, deriving domain from hostname and author from URL.
-
-    subcategory and pag stay blank here. apply_category_rules fills them when
-    the domain is in the country file.
-    """
+    """Build one export row, deriving domain from hostname and author from URL."""
     domain = domain_from_hostname(hostname)
     return {
         "date": day,
         "topic": topic,
         "platform": platform,
         "category": category_label(category, hostname, domain),
-        "subcategory": None,
-        "pag": None,
         "mentioned": mentioned,
         "url": url,
         "hostname": hostname,
@@ -259,15 +237,14 @@ def citation_row(
 
 def apply_category_rules(
     rows: list[dict[str, object]],
-    domains: dict[str, tuple[str, str, str]] | None = None,
+    domains: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     """Apply Owned-host labels, then the country domain file.
 
-    A listed domain overwrites category and sets subcategory and pag. The
-    file category is shown with Profound's labels, so Institution becomes
-    Institutions. Any other domain keeps the Profound category, including
-    Owned-host overrides, with subcategory and pag blank. A blank category
-    cell in the file does not wipe the Profound label.
+    A listed domain overwrites category. The file category is shown with
+    Profound's labels, so Institution becomes Institutions. Any other domain
+    keeps the Profound category, including Owned-host overrides. A blank
+    category cell in the file does not wipe the Profound label.
     """
     if domains is None:
         domains = load_citation_domains(active_country().slug)
@@ -276,14 +253,9 @@ def apply_category_rules(
         domain = row.get("domain") or domain_from_hostname(hostname)
         row["domain"] = domain
         row["category"] = category_label(row.get("category"), hostname, domain)
-        file_category, subcategory, pag = domains.get(
-            _domain_key(domain), ("", "", "")
-        )
-        labeled = display_category(file_category)
+        labeled = display_category(domains.get(_domain_key(domain), ""))
         if labeled:
             row["category"] = labeled
-        row["subcategory"] = subcategory or None
-        row["pag"] = pag or None
     return rows
 
 

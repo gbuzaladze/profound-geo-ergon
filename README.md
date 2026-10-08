@@ -46,10 +46,10 @@ pipeline logic. It never creates data CSVs. Each daily run:
 5. atomically replaces the complete citation table; and
 6. rebuilds dimensions from both SQL fact tables.
 
-The timer checks hourly and starts one deterministic run per Toronto calendar
-day after 6:00 AM. This keeps the schedule correct across daylight-saving
-changes and catches up after a temporary outage. Countries run sequentially
-to respect the shared Profound API quota.
+The timer checks hourly on Tuesday and starts one deterministic run after
+6:00 AM Toronto. This keeps the schedule correct across daylight-saving
+changes and catches up later that Tuesday after a temporary outage. Countries
+run sequentially to respect the shared Profound API quota.
 
 The existing CLI commands are unchanged and continue writing CSVs. Azure
 Functions uses managed identity for SQL; local CLI runs can continue using
@@ -202,18 +202,16 @@ $env:PYTHONPATH = "src"
 Pages through V2 Visibility answers and flattens citations to the Citations UI
 columns.
 
-Columns: `date`, `topic`, `platform`, `category`, `subcategory`, `pag`,
-`mentioned`, `url`, `hostname`, `domain`, `path`, `author`, `tags`, `region`.
+Columns: `date`, `topic`, `platform`, `category`, `mentioned`, `url`,
+`hostname`, `domain`, `path`, `author`, `tags`, `region`.
 `category` is a display label (`earned_media` → `Earned Media`;
 `earned_institutions` → `Institutions`). Hostnames or domains listed in
 `owned_citation_hosts`, or containing a string in `owned_citation_contains`,
 are forced to `Owned` regardless of the API category. When
 `citation-domains/citation-domains-{slug}.csv` exists, a matching `domain` overwrites that
-category and sets `subcategory` and `pag` (`TRUE` or `FALSE`). The file
-category is stored with Profound's labels (`Institution` becomes
-`Institutions`). A domain that
-is not in the file keeps the Profound category, with `subcategory` and `pag`
-blank. `domain` is the
+category. The file category is stored with Profound's labels (`Institution`
+becomes `Institutions`). A domain that is not in the file keeps the Profound
+category. `domain` is the
 registrable domain from `hostname` via the Public Suffix List (e.g.
 `www.ergon.com` → `ergon.com`).
 
@@ -238,7 +236,10 @@ already have `author` are left alone. Set
 `CITATION_AUTHOR_INSTAGRAM_LIVE_LOOKUP=0` to skip only Instaloader shortcode
 lookups. After three consecutive Instagram failures the job cools down
 (`CITATION_AUTHOR_INSTAGRAM_COOLDOWN_SECONDS`, default 300) and continues, so
-a temporary block does not abandon the rest of the shortcodes.
+a temporary block does not abandon the rest of the shortcodes. Set
+`CITATION_AUTHOR_INSTAGRAM_MAX_SECONDS` to cap Instaloader time per country,
+cooldowns included; remaining shortcodes keep a blank `author`. The default
+`0` means no limit.
 
 Recompute authors on an existing CSV without a Profound pull:
 

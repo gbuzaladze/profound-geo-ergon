@@ -209,7 +209,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       AZURE_SQL_SERVER: sqlServer
       AZURE_SQL_DATABASE: sqlDatabase
       PROFOUND_API_KEY: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=profound-api-key)'
-      PIPELINE_TIMER_SCHEDULE: '0 0 * * * *'
+      PIPELINE_TIMER_SCHEDULE: '0 0 * * * 2'
       TASKHUB_NAME: taskHub.name
       DURABLE_TASK_SCHEDULER_CONNECTION_STRING: 'Endpoint=${scheduler.properties.endpoint};TaskHub=${taskHub.name};Authentication=ManagedIdentity;ClientID=${identity.properties.clientId}'
     }

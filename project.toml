@@ -26,11 +26,10 @@ owned_aliases = []
 # text, so a country site that contains ergon is Owned without listing
 # each country code. Product sites that do not contain that text stay in
 # owned_citation_hosts.
-# citation-domains/citation-domains-{slug}.csv overrides category when domain matches, and
-# fills subcategory and pag (TRUE or FALSE). A domain that is not in the file
-# keeps the Profound category, including the Owned overrides above, with
-# subcategory and pag blank. The same file name applies to every country;
-# a missing file leaves that country on the Profound category.
+# citation-domains/citation-domains-{slug}.csv overrides category when domain matches.
+# A domain that is not in the file keeps the Profound category, including the
+# Owned overrides above. The same file name applies to every country; a missing
+# file leaves that country on the Profound category.
 owned_citation_contains = ["ergon"]
 owned_citation_hosts = ["ergon.com"]
 

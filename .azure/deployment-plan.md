@@ -9,7 +9,7 @@ preserving the current CLI and CSV workflow.
 
 ## Confirmed behavior
 
-- Run daily at 6:00 AM America/Toronto.
+- Run every Tuesday at 6:00 AM America/Toronto.
 - Keep the full historical scores refresh.
 - Pull citations incrementally using Azure SQL as the cloud watermark.
 - Replace the complete citations table in SQL after a successful incremental pull.

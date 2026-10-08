@@ -113,6 +113,11 @@ def instagram_cooldown_seconds() -> float:
     )
 
 
+def instagram_budget_seconds() -> float:
+    """Instaloader time budget per country export; 0 (the default) means no limit."""
+    return _env_nonnegative_seconds("CITATION_AUTHOR_INSTAGRAM_MAX_SECONDS", 0.0)
+
+
 # Instagram classification (ported from Instagram/instagram_citation_enricher.py)
 
 
@@ -393,6 +398,8 @@ def apply_authors(
     cooldown_seconds: float | None = None,
     sleep: Callable[[float], None] | None = None,
     live_from: str | None = None,
+    instagram_budget: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> list[dict[str, object]]:
     """Fill `author` from the URL, then live-lookup remaining Instagram/YouTube rows.
 
@@ -438,6 +445,12 @@ def apply_authors(
             ),
             sleep=sleep,
             live_from=live_from,
+            instagram_budget=(
+                instagram_budget_seconds()
+                if instagram_budget is None
+                else instagram_budget
+            ),
+            clock=clock,
         )
     return rows
 
@@ -476,19 +489,27 @@ def _enrich_authors_live(
     sleep: Callable[[float], None] | None,
     skip_instagram: bool = False,
     live_from: str | None = None,
+    instagram_budget: float = 0.0,
+    clock: Callable[[], float] | None = None,
 ) -> None:
     """Look up unique Instagram shortcodes and YouTube videos still missing author.
 
     After several consecutive Instagram failures, pause for `cooldown_seconds`
-    and continue. Do not abandon the rest of the shortcodes for the run.
-    When `live_from` is set, only that date forward is looked up. A shortcode
-    or video resolved there is copied onto older rows that cite the same URL.
+    and continue. When `instagram_budget` is positive, Instagram lookups stop
+    once that many seconds have passed, including cooldowns; YouTube lookups
+    continue. When `live_from` is set, only that date forward is looked up. A
+    shortcode or video resolved there is copied onto older rows that cite the
+    same URL.
     """
     instagram_resolver = resolve_instagram or resolve_instagram_shortcode
     youtube_resolver = resolve_youtube or resolve_youtube_video
     pause = sleep
     if pause is None:
         from time import sleep as pause
+    now = clock
+    if now is None:
+        from time import monotonic as now
+    instagram_started = now()
 
     if skip_instagram:
         print("Instagram live lookup skipped.", flush=True)
@@ -499,6 +520,7 @@ def _enrich_authors_live(
     instagram_lookups = 0
     instagram_resolved = 0
     cooldown_count = 0
+    instagram_stopped = False
 
     for row in rows:
         if not _in_live_window(row, live_from):
@@ -518,6 +540,19 @@ def _enrich_authors_live(
             if classification.get("url_type") == "Post" and shortcode:
                 key = str(shortcode)
                 if key not in instagram_cache:
+                    if instagram_stopped:
+                        continue
+                    elapsed = now() - instagram_started
+                    if instagram_budget > 0 and elapsed >= instagram_budget:
+                        instagram_stopped = True
+                        print(
+                            "Instagram live lookup stopped after "
+                            f"{elapsed / 60:.1f} minutes "
+                            f"({instagram_resolved}/{instagram_lookups} resolved); "
+                            "remaining shortcodes keep a blank author.",
+                            flush=True,
+                        )
+                        continue
                     handle = instagram_resolver(key)
                     instagram_cache[key] = handle
                     instagram_lookups += 1
@@ -536,8 +571,12 @@ def _enrich_authors_live(
                                 f"{instagram_resolved}/{instagram_lookups} resolved so far).",
                                 flush=True,
                             )
-                            if cooldown_seconds > 0:
-                                pause(cooldown_seconds)
+                            wait = cooldown_seconds
+                            if instagram_budget > 0:
+                                remaining = instagram_budget - (now() - instagram_started)
+                                wait = min(wait, max(0.0, remaining))
+                            if wait > 0:
+                                pause(wait)
                             instagram_failures = 0
                     if delay_seconds > 0:
                         pause(delay_seconds)
