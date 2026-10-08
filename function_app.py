@@ -20,6 +20,14 @@ SCHEDULE_WEEKDAY = 1
 
 app = df.DFApp()
 
+# Retry a failed country hourly, matching the API quota recovery window.
+# azure-functions-durable 1.7 accepts only these two options; its default
+# backoff is fixed, so every retry waits the same hour.
+COUNTRY_RETRY = df.RetryOptions(
+    first_retry_interval_in_milliseconds=3_600_000,
+    max_number_of_attempts=3,
+)
+
 
 def scheduled_instance_id(now: datetime) -> str | None:
     """Return this Tuesday's run ID after 6 AM Toronto."""
@@ -75,19 +83,11 @@ def pipeline_orchestrator(
     """Run countries sequentially so they share one Profound API quota."""
     payload = context.get_input() or {}
     countries = payload.get("countries") or []
-    # Retry a failed country hourly, matching the API quota recovery window.
-    # The fixed delay avoids rapid retries after a Profound rate-limit response.
-    retry = df.RetryOptions(
-        first_retry_interval_in_milliseconds=3_600_000,
-        max_number_of_attempts=3,
-        backoff_coefficient=1.0,
-        max_retry_interval_in_milliseconds=3_600_000,
-    )
     results = []
     for country_slug in countries:
         context.set_custom_status({"country": country_slug, "state": "running"})
         result = yield context.call_activity_with_retry(
-            "run_country_activity", retry, country_slug
+            "run_country_activity", COUNTRY_RETRY, country_slug
         )
         results.append(result)
     context.set_custom_status({"state": "completed", "countries": len(results)})
