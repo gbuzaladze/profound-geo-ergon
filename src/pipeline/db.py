@@ -20,7 +20,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -34,6 +34,11 @@ from pipeline.config import active_country, project_root
 _BULK_BATCH_SIZE = 5000
 _BULK_TIMEOUT_SECONDS = 3600
 _CONNECT_TIMEOUT_SECONDS = 60
+# Serverless Azure SQL rejects logins (error 40613) while it resumes from
+# auto-pause; resume usually takes about a minute, so retry for ~5 minutes.
+_CONNECT_ATTEMPTS = 10
+_CONNECT_RETRY_SECONDS = 30
+_RESUMING_MARKERS = ("40613", "not currently available")
 
 # Set by --skip-db so exporters can still write CSVs without Azure credentials.
 _SKIP_ENV = "AZURE_SQL_SKIP"
@@ -196,7 +201,30 @@ def _qualified(schema: str, table: str) -> str:
     return f"[{schema}].[{table}]"
 
 
+def _is_resuming(error: Exception) -> bool:
+    """True when Azure SQL refused the login because the database is resuming."""
+    message = str(error).casefold()
+    return any(marker in message for marker in _RESUMING_MARKERS)
+
+
 def _connect(settings: dict[str, str]):
+    """Open an Azure SQL connection, waiting while a paused database resumes."""
+    for attempt in range(1, _CONNECT_ATTEMPTS):
+        try:
+            return _open_connection(settings)
+        except Exception as error:
+            if not _is_resuming(error):
+                raise
+            print(
+                "  Azure SQL is resuming; retrying connection in "
+                f"{_CONNECT_RETRY_SECONDS}s (attempt {attempt}/{_CONNECT_ATTEMPTS})",
+                flush=True,
+            )
+            sleep(_CONNECT_RETRY_SECONDS)
+    return _open_connection(settings)
+
+
+def _open_connection(settings: dict[str, str]):
     """Open an encrypted Azure SQL connection.
 
     Local SQL login credentials remain supported. Azure-hosted runs omit them

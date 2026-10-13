@@ -6,7 +6,12 @@ import os
 import unittest
 from unittest.mock import patch
 
-from pipeline.db import _replace_with_rows, _sql_env
+from pipeline.db import _connect, _replace_with_rows, _sql_env
+
+RESUMING_ERROR = RuntimeError(
+    "Database 'geo' on server 'geo.database.windows.net' is not currently "
+    "available. Please retry the connection later."
+)
 
 
 class FakeConnection:
@@ -113,6 +118,48 @@ class AtomicReplacementTests(unittest.TestCase):
         self.assertIn("DELETE target", statements)
         self.assertIn("target.[region] IN", statements)
         self.assertIn("INSERT INTO [dbo].[fact_scores_summarized]", statements)
+
+
+class ConnectRetryTests(unittest.TestCase):
+    def test_retries_while_paused_database_resumes(self) -> None:
+        connection = FakeConnection()
+        with (
+            patch(
+                "pipeline.db._open_connection",
+                side_effect=[RESUMING_ERROR, RESUMING_ERROR, connection],
+            ) as opener,
+            patch("pipeline.db.sleep") as sleeper,
+        ):
+            self.assertIs(_connect({}), connection)
+
+        self.assertEqual(opener.call_count, 3)
+        self.assertEqual(sleeper.call_count, 2)
+
+    def test_other_errors_are_not_retried(self) -> None:
+        with (
+            patch(
+                "pipeline.db._open_connection",
+                side_effect=RuntimeError("Login failed for user"),
+            ) as opener,
+            patch("pipeline.db.sleep") as sleeper,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Login failed"):
+                _connect({})
+
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
+
+    def test_gives_up_after_last_attempt(self) -> None:
+        with (
+            patch(
+                "pipeline.db._open_connection", side_effect=RESUMING_ERROR
+            ) as opener,
+            patch("pipeline.db.sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not currently available"):
+                _connect({})
+
+        self.assertEqual(opener.call_count, 10)
 
 
 if __name__ == "__main__":
