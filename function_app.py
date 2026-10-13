@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 
 import azure.durable_functions as df
 import azure.functions as func
+from azure.durable_functions.models.DurableOrchestrationStatus import (
+    DurableOrchestrationStatus,
+)
 
 from pipeline.cloud import run_country
 from pipeline.config import COUNTRIES
@@ -40,6 +43,12 @@ def scheduled_instance_id(now: datetime) -> str | None:
     return f"geo-weekly-{local_now.date().isoformat()}"
 
 
+def instance_exists(status: DurableOrchestrationStatus | None) -> bool:
+    """Return whether get_status found an orchestration."""
+    # get_status returns an empty status object, not None, for an unknown ID.
+    return status is not None and status.runtime_status is not None
+
+
 @app.timer_trigger(
     schedule="%PIPELINE_TIMER_SCHEDULE%",
     arg_name="timer",
@@ -55,7 +64,7 @@ async def scheduled_pipeline(
     if instance_id is None:
         return
     existing = await client.get_status(instance_id)
-    if existing is not None:
+    if instance_exists(existing):
         LOGGER.info(
             "Weekly pipeline already exists instance_id=%s status=%s",
             instance_id,
