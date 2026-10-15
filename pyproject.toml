@@ -7,8 +7,6 @@ description = "Extract Profound visibility data for Power BI."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "azure-functions==1.25.0",
-    "azure-functions-durable==1.7.0",
     "azure-identity>=1.19.0,<2",
     "instaloader==4.15.3",
     "mssql-python==1.14.0",
@@ -28,7 +26,7 @@ export-dims = "pipeline.dims:main"
 export-db = "pipeline.db:main"
 export-all = "pipeline.__main__:main"
 
-# Hatchling packages the src-layout module for Azure deployment and local use.
+# Hatchling packages the src-layout module.
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

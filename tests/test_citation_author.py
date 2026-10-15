@@ -12,7 +12,14 @@ from pipeline.citation_author import (
     youtube_video_id,
 )
 from pipeline.db import _grain_columns
-from pipeline.raw_citations import FIELDNAMES, citation_row
+from pipeline.raw_citations import (
+    FIELDNAMES,
+    INCLUDE,
+    citation_row,
+    flatten_answer,
+    restore_saved_authors,
+    scan_end_through_latest,
+)
 
 
 class InstagramClassificationTests(unittest.TestCase):
@@ -258,6 +265,10 @@ class ApplyAuthorsTests(unittest.TestCase):
 class CitationExportTests(unittest.TestCase):
     def test_fieldnames_match_sql_grain(self) -> None:
         self.assertEqual(FIELDNAMES, _grain_columns("fact_raw_citations"))
+        self.assertEqual(
+            FIELDNAMES[FIELDNAMES.index("prompt") : FIELDNAMES.index("tags") + 1],
+            ["prompt", "tags"],
+        )
 
     def test_citation_row_includes_url_author(self) -> None:
         row = citation_row(
@@ -270,9 +281,88 @@ class CitationExportTests(unittest.TestCase):
             hostname="www.reddit.com",
             path="/r/breastcancer/comments/abc/",
             tags="oncology",
+            prompt="What is Ergon used for?",
             region="United States",
         )
         self.assertEqual(row["author"], "r/breastcancer")
+        self.assertEqual(row["prompt"], "What is Ergon used for?")
+
+    def test_flatten_answer_copies_prompt_onto_each_citation(self) -> None:
+        class _Answer:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "date": "2026-09-20",
+                    "model": {"name": "ChatGPT"},
+                    "topic": {"name": "Specialty fluids"},
+                    "region": "United States",
+                    "tags": ["fluids", "hcp"],
+                    "prompt": "What is Ergon used for?",
+                    "mentions": ["Ergon"],
+                    "citation_details": [
+                        {
+                            "url": "https://example.org/a",
+                            "hostname": "example.org",
+                            "path": "/a",
+                            "citation_category": "earned_media",
+                        },
+                        {
+                            "url": "https://example.org/b",
+                            "hostname": "example.org",
+                            "path": "/b",
+                            "citation_category": "owned",
+                        },
+                    ],
+                }
+
+        self.assertIn("prompt", INCLUDE)
+        rows = flatten_answer(_Answer())
+        self.assertEqual(
+            [row["prompt"] for row in rows],
+            ["What is Ergon used for?", "What is Ergon used for?"],
+        )
+        self.assertEqual(rows[0]["tags"], "fluids|hcp")
+
+    def test_through_latest_stops_at_stored_date(self) -> None:
+        self.assertEqual(
+            scan_end_through_latest("2026-10-12", yesterday="2026-10-14"),
+            "2026-10-12",
+        )
+        self.assertEqual(
+            scan_end_through_latest("2026-10-15", yesterday="2026-10-14"),
+            "2026-10-14",
+        )
+
+    def test_restore_saved_authors_fills_only_blanks(self) -> None:
+        rows = [
+            {
+                "date": "2026-10-12",
+                "region": "United States",
+                "topic": "Specialty fluids",
+                "platform": "ChatGPT",
+                "url": "https://www.instagram.com/p/AbCdEf123/",
+                "author": None,
+            },
+            {
+                "date": "2026-10-12",
+                "region": "United States",
+                "topic": "Specialty fluids",
+                "platform": "ChatGPT",
+                "url": "https://www.reddit.com/r/breastcancer/comments/abc/",
+                "author": "r/breastcancer",
+            },
+        ]
+        pool = {
+            (
+                "2026-10-12",
+                "United States",
+                "Specialty fluids",
+                "ChatGPT",
+                "https://www.instagram.com/p/AbCdEf123/",
+            ): ["@ergon"],
+        }
+        self.assertEqual(restore_saved_authors(rows, pool), 1)
+        self.assertEqual(rows[0]["author"], "@ergon")
+        self.assertEqual(rows[1]["author"], "r/breastcancer")
 
     def test_live_lookup_env_off(self) -> None:
         rows = [

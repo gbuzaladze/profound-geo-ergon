@@ -96,6 +96,7 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("domain", "NVARCHAR(200) NULL"),
         ("path", "NVARCHAR(MAX) NULL"),
         ("author", "NVARCHAR(200) NULL"),
+        ("prompt", "NVARCHAR(MAX) NULL"),
         ("tags", "NVARCHAR(MAX) NULL"),
         ("region", "NVARCHAR(200) NULL"),
         _LOAD_DATE_DDL,
@@ -134,6 +135,7 @@ _WIDEN_TO_MAX = {
         ("url", True),
         ("path", True),
         ("tags", True),
+        ("prompt", True),
     ),
     "dim_prompt": (
         ("prompt", False),
@@ -227,8 +229,8 @@ def _connect(settings: dict[str, str]):
 def _open_connection(settings: dict[str, str]):
     """Open an encrypted Azure SQL connection.
 
-    Local SQL login credentials remain supported. Azure-hosted runs omit them
-    and authenticate with the Function App's managed identity.
+    Local SQL login credentials remain supported. When they are omitted, the
+    connection uses Azure managed identity.
     """
     if not settings["AZURE_SQL_USERNAME"]:
         client_id = (os.getenv("AZURE_CLIENT_ID") or "").strip()
@@ -285,8 +287,10 @@ def _table_column_sql(table: str) -> str:
 def ensure_schema_and_tables(cursor, schema: str) -> None:
     """Create the schema, if needed, and the reporting tables when they are missing.
 
-    Existing tables are not rebuilt. Narrow text columns are widened in place,
-    and `load_date` is added when absent.
+    Existing tables are not rebuilt, except `fact_raw_citations` when its
+    columns differ from TABLES (for example `prompt` missing or out of order).
+    A new `prompt` stays null until the next citation load. Narrow text
+    columns are widened in place, and `load_date` is added when absent.
     """
     # CREATE SCHEMA must be its own batch; run it only when the schema is new.
     cursor.execute("SELECT 1 FROM sys.schemas WHERE name = ?", (schema,))
@@ -309,6 +313,8 @@ def ensure_schema_and_tables(cursor, schema: str) -> None:
         )
         _widen_existing_text_columns(cursor, schema, table)
         _ensure_load_date_column(cursor, schema, table)
+        if table == "fact_raw_citations":
+            _ensure_citation_prompt_column(cursor, schema)
         if table in _DATE_INDEXED:
             # Nonclustered date index for Power BI / slicer filters on large facts.
             index_name = f"IX_{table}_date"
@@ -363,6 +369,73 @@ def _ensure_load_date_column(cursor, schema: str, table: str) -> None:
     cursor.execute(
         f"ALTER TABLE {_qualified(schema, table)} ADD [{LOAD_DATE_COLUMN}] DATETIME2 NULL"
     )
+
+
+def _table_column_names(cursor, schema: str, table: str) -> list[str]:
+    """Return column names in CREATE TABLE order."""
+    cursor.execute(
+        """
+        SELECT c.name
+        FROM sys.columns AS c
+        JOIN sys.tables AS t ON t.object_id = c.object_id
+        JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+        WHERE s.name = ? AND t.name = ?
+        ORDER BY c.column_id
+        """,
+        (schema, table),
+    )
+    return [str(row[0]) for row in cursor.fetchall()]
+
+
+def _columns_match(actual: list[str], desired: list[str]) -> bool:
+    """True when two column lists are the same names in the same order."""
+    return [name.casefold() for name in actual] == [name.casefold() for name in desired]
+
+
+def _stage_reordered_table(cursor, schema: str, table: str) -> tuple[str, str]:
+    """Create an empty copy of `table` in the current column order.
+
+    Returns the staging name and its qualified identifier. The caller copies
+    rows, then `_swap_reordered_table` replaces the original.
+    """
+    staging = f"{table}__reorder"
+    qualified_stage = _qualified(schema, staging)
+    cursor.execute(
+        f"IF OBJECT_ID(N'{schema}.{staging}', N'U') IS NOT NULL "
+        f"DROP TABLE {qualified_stage}"
+    )
+    cursor.execute(f"CREATE TABLE {qualified_stage} ({_table_column_sql(table)})")
+    return staging, qualified_stage
+
+
+def _swap_reordered_table(cursor, schema: str, table: str, staging: str) -> None:
+    """Drop the original table and rename the staged copy into its place."""
+    cursor.execute(f"DROP TABLE {_qualified(schema, table)}")
+    cursor.execute(f"EXEC sp_rename N'{schema}.{staging}', N'{table}'")
+
+
+def _ensure_citation_prompt_column(cursor, schema: str) -> None:
+    """Put `prompt` immediately before `tags` on an existing citations table.
+
+    SQL Server appends new columns, so a table created before `prompt` is
+    copied into a new table with the current column order. Rows keep their
+    existing values; a missing `prompt` stays null until the next citation load.
+    """
+    table = "fact_raw_citations"
+    desired = _columns(table)
+    actual = _table_column_names(cursor, schema, table)
+    if _columns_match(actual, desired):
+        return
+    staging, qualified_stage = _stage_reordered_table(cursor, schema, table)
+    present = {name.casefold() for name in actual}
+    shared = [name for name in desired if name.casefold() in present]
+    if shared:
+        cols = ", ".join(f"[{name}]" for name in shared)
+        cursor.execute(
+            f"INSERT INTO {qualified_stage} ({cols}) "
+            f"SELECT {cols} FROM {_qualified(schema, table)}"
+        )
+    _swap_reordered_table(cursor, schema, table, staging)
 
 
 # Value conversion

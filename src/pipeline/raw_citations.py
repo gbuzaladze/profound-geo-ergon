@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any
@@ -70,6 +71,7 @@ INCLUDE = [
     "topic",
     "region",
     "tags",
+    "prompt",
     "mentions",
     "citations",
     "citation_details",
@@ -85,6 +87,7 @@ FIELDNAMES = [
     "domain",
     "path",
     "author",
+    "prompt",
     "tags",
     "region",
 ]
@@ -214,6 +217,7 @@ def citation_row(
     url: object,
     hostname: object,
     path: object,
+    prompt: object,
     tags: object,
     region: object,
 ) -> dict[str, object]:
@@ -230,6 +234,7 @@ def citation_row(
         "domain": domain,
         "path": path,
         "author": author_from_url(url, hostname),
+        "prompt": prompt,
         "tags": tags,
         "region": region,
     }
@@ -272,6 +277,8 @@ def flatten_answer(answer: object) -> list[dict[str, object]]:
     topic = ref_name(_answer_field(payload, answer, "topic"))
     region = ref_name(_answer_field(payload, answer, "region"))
     tags = join_values(_answer_field(payload, answer, "tags"))
+    # Same Visibility question for every citation on this answer.
+    prompt = ref_name(_answer_field(payload, answer, "prompt")) or None
     mentioned = join_values(_answer_field(payload, answer, "mentions"))
     details = _answer_field(payload, answer, "citation_details") or []
     citations = _answer_field(payload, answer, "citations") or []
@@ -295,6 +302,7 @@ def flatten_answer(answer: object) -> list[dict[str, object]]:
                     hostname=hostname,
                     path=item.get("path"),
                     tags=tags,
+                    prompt=prompt,
                     region=region,
                 )
             )
@@ -315,6 +323,7 @@ def flatten_answer(answer: object) -> list[dict[str, object]]:
                 hostname=hostname,
                 path=urlparse(url).path or None,
                 tags=tags,
+                prompt=prompt,
                 region=region,
             )
         )
@@ -348,10 +357,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Refresh from the last date already in data/{country}/fact_raw_citations.csv.",
     )
+    mode.add_argument(
+        "--through-latest",
+        action="store_true",
+        help=(
+            "Re-pull START_DATE through the latest date already in "
+            "dbo.fact_raw_citations for this category. Does not extend the "
+            "table to yesterday."
+        ),
+    )
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="With --full, ignore any checkpoint and start over.",
+        help="With --full or --through-latest, ignore any checkpoint and start over.",
     )
     parser.add_argument(
         "--enrich-authors",
@@ -519,9 +537,16 @@ def last_date_in_rows(rows: list[dict[str, object]], *, path: Path) -> str:
     return max(dates)
 
 
-def run_full(*, fresh: bool) -> tuple[list[dict[str, object]], int, int, str, str]:
-    """Original backfill from START_DATE, with hourly-limit pauses and resume."""
-    scan_end = end_date()
+def run_full(
+    *, fresh: bool, scan_end: str | None = None
+) -> tuple[list[dict[str, object]], int, int, str, str]:
+    """Original backfill from START_DATE, with hourly-limit pauses and resume.
+
+    `scan_end` overrides yesterday. A checkpoint is resumed only when it used
+    that same end date, so a capped re-pull does not continue an older window.
+    """
+    requested_end = scan_end
+    scan_end = requested_end or end_date()
     cursor: str | None = None
     answers_scanned = 0
     api_calls = 0
@@ -533,6 +558,17 @@ def run_full(*, fresh: bool) -> tuple[list[dict[str, object]], int, int, str, st
         print("Starting a fresh full pull.", flush=True)
     else:
         checkpoint = load_checkpoint()
+        if (
+            checkpoint
+            and requested_end
+            and str(checkpoint.get("end_date") or "") != requested_end
+        ):
+            clear_checkpoint()
+            print(
+                "Cleared a checkpoint for a different scan end. Starting over.",
+                flush=True,
+            )
+            checkpoint = None
         if checkpoint:
             cursor = checkpoint.get("cursor")
             answers_scanned = int(checkpoint.get("answers_scanned") or 0)
@@ -660,6 +696,154 @@ def run_incremental_sql() -> tuple[list[dict[str, object]], int, int, str, str]:
     return kept + new_rows, answers_scanned, api_calls, start, scan_end
 
 
+def scan_end_through_latest(latest: str, *, yesterday: str | None = None) -> str:
+    """Cap a re-pull at the latest stored citation date.
+
+    Yesterday is still the ceiling, so a table that is already current does
+    not request today's incomplete Profound data.
+    """
+    ceiling = yesterday if yesterday is not None else end_date()
+    if latest > ceiling:
+        return ceiling
+    return latest
+
+
+def citation_table_max_date() -> str:
+    """Return MAX(date) for this category's regions in dbo.fact_raw_citations.
+
+    This does not migrate the table. Schema changes wait until the replacement
+    load so a long pull is not preceded by a full copy of the existing rows.
+    """
+    from pipeline.db import SQL_SCHEMA, sql_connection
+
+    regions = list(active_country().regions)
+    if not regions:
+        raise SystemExit(f"{active_country().slug} has no regions in its name.")
+    placeholders = ", ".join("?" for _ in regions)
+    with sql_connection() as conn:
+        if conn is None:
+            raise SystemExit(
+                "Azure SQL must be configured to read the latest citation date."
+            )
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT MAX([date])
+            FROM [{SQL_SCHEMA}].[fact_raw_citations]
+            WHERE [region] IN ({placeholders})
+            """,
+            tuple(regions),
+        )
+        row = cursor.fetchone()
+    value = None if row is None else row[0]
+    if value is None:
+        names = ", ".join(regions)
+        raise SystemExit(
+            f"[{SQL_SCHEMA}].[fact_raw_citations] has no dated rows for {names}. "
+            "Run a --full pull first."
+        )
+    if hasattr(value, "isoformat"):
+        return value.isoformat()[:10]
+    return str(value)[:10]
+
+
+def _author_restore_key(row: Mapping[str, object]) -> tuple[str, str, str, str, str]:
+    """Match an existing author to a re-pulled citation row."""
+    day = row.get("date")
+    if hasattr(day, "isoformat"):
+        day = day.isoformat()
+    return (
+        str(day or "")[:10],
+        str(row.get("region") or ""),
+        str(row.get("topic") or ""),
+        str(row.get("platform") or ""),
+        str(row.get("url") or ""),
+    )
+
+
+def load_saved_authors() -> dict[tuple[str, str, str, str, str], list[str]]:
+    """Read authors that a URL re-parse cannot recover.
+
+    Instagram shortcodes and YouTube video URLs were filled by live lookup on
+    an earlier run. A prompt backfill turns that lookup off, then puts these
+    authors back on rows the new pull left blank.
+    """
+    from pipeline.db import SQL_SCHEMA, sql_connection
+
+    regions = list(active_country().regions)
+    if not regions:
+        raise SystemExit(f"{active_country().slug} has no regions in its name.")
+    placeholders = ", ".join("?" for _ in regions)
+    with sql_connection() as conn:
+        if conn is None:
+            raise SystemExit(
+                "Azure SQL must be configured to keep existing citation authors."
+            )
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT [date], [region], [topic], [platform], [url], [author]
+            FROM [{SQL_SCHEMA}].[fact_raw_citations]
+            WHERE [author] IS NOT NULL AND [author] <> N''
+              AND [region] IN ({placeholders})
+              AND (
+                [hostname] LIKE N'%instagram.com'
+                OR [hostname] LIKE N'%youtube.com'
+                OR [hostname] LIKE N'%youtu.be'
+              )
+            """,
+            tuple(regions),
+        )
+        fetched = cursor.fetchall()
+    pool: dict[tuple[str, str, str, str, str], list[str]] = {}
+    for day, region, topic, platform, url, author in fetched:
+        key = _author_restore_key(
+            {
+                "date": day,
+                "region": region,
+                "topic": topic,
+                "platform": platform,
+                "url": url,
+            }
+        )
+        pool.setdefault(key, []).append(str(author))
+    return pool
+
+
+def restore_saved_authors(
+    rows: list[dict[str, object]],
+    pool: Mapping[tuple[str, str, str, str, str], list[str]],
+) -> int:
+    """Fill blank authors from the pre-pull pool. Parsed authors are kept."""
+    restored = 0
+    for row in rows:
+        if str(row.get("author") or "").strip():
+            continue
+        bucket = pool.get(_author_restore_key(row))
+        if not bucket:
+            continue
+        row["author"] = bucket.pop(0)
+        restored += 1
+    return restored
+
+
+def run_through_latest(
+    *, fresh: bool
+) -> tuple[list[dict[str, object]], int, int, str, str]:
+    """Re-pull from START_DATE through the latest date already stored.
+
+    The scan stops at that date even when yesterday is later, so the citation
+    table does not gain new days. Today's incomplete data is still excluded.
+    """
+    latest = citation_table_max_date()
+    scan_end = scan_end_through_latest(latest)
+    print(
+        f"Through latest stored date {scan_end} (table max {latest}).",
+        flush=True,
+    )
+    return run_full(fresh=fresh, scan_end=scan_end)
+
+
 def export(
     *,
     mode: str | None = None,
@@ -670,9 +854,11 @@ def export(
 ) -> dict[str, object]:
     """Export raw citations for the active country.
 
-    `mode` is `full`, `incremental`, or None (incremental if the CSV exists).
-    `fresh` only applies to full pulls: ignore checkpoint and start over.
-    Cloud execution uses `state_source="sql"` with `csv_output=False`.
+    `mode` is `full`, `through-latest`, `incremental`, or None (incremental
+    if the CSV exists). `through-latest` re-pulls through the latest SQL date
+    and does not add days through yesterday. `fresh` ignores a checkpoint on
+    full and through-latest pulls.
+    SQL-backed runs use `state_source="sql"` with `csv_output=False`.
     """
     started = perf_counter()
     if state_source not in {"csv", "sql"}:
@@ -681,9 +867,16 @@ def export(
         raise ValueError("SQL-backed citation exports must use incremental mode.")
     resolved = mode or ("incremental" if output_path().exists() else "full")
     print(f"Mode: {resolved}", flush=True)
+    # A prompt backfill rewrites citations only. Dimensions stay as they are.
+    if resolved == "through-latest":
+        rebuild_dimensions = False
 
     if resolved == "full":
         rows, answers_scanned, api_calls, start, scan_end = run_full(fresh=fresh)
+    elif resolved == "through-latest":
+        rows, answers_scanned, api_calls, start, scan_end = run_through_latest(
+            fresh=fresh
+        )
     elif state_source == "sql":
         rows, answers_scanned, api_calls, start, scan_end = run_incremental_sql()
     else:
@@ -695,10 +888,20 @@ def export(
 
     rows = apply_category_rules(rows)
     # Incremental pulls only look up the refreshed dates. --enrich-authors
-    # still walks the whole file.
+    # still walks the whole file. A through-latest pull keeps authors already
+    # stored for Instagram and YouTube instead of looking them up again.
+    saved_authors = load_saved_authors() if resolved == "through-latest" else None
     rows = apply_authors(
-        rows, live_from=start if resolved == "incremental" else None
+        rows,
+        live_lookup=False if resolved == "through-latest" else None,
+        live_from=start if resolved == "incremental" else None,
     )
+    if saved_authors is not None:
+        restored = restore_saved_authors(rows, saved_authors)
+        print(
+            f"Restored {restored} authors from the existing citation table.",
+            flush=True,
+        )
     rows.sort(key=sort_key)
     destination = publish_table(
         rows,
@@ -708,7 +911,7 @@ def export(
     )
     if rebuild_dimensions:
         publish_dimensions(csv_output=csv_output)
-    if resolved == "full":
+    if resolved in {"full", "through-latest"}:
         # Checkpoint is only for a paused backfill; incremental has no partial file.
         clear_checkpoint()
 
@@ -799,9 +1002,10 @@ def enrich_authors_existing() -> dict[str, object]:
 def main(argv: list[str] | None = None) -> None:
     """Export raw citations in full or incremental mode for one or more countries."""
     args = parse_args(argv)
-    if args.fresh and not args.full:
-        raise SystemExit("--fresh can only be used with --full.")
-    if args.enrich_authors and (args.full or args.incremental or args.fresh):
+    if args.fresh and not (args.full or args.through_latest):
+        raise SystemExit("--fresh can only be used with --full or --through-latest.")
+    pull_flags = (args.full, args.incremental, args.fresh, args.through_latest)
+    if args.enrich_authors and any(pull_flags):
         raise SystemExit("--enrich-authors cannot be combined with pull flags.")
 
     for country in countries_from_args(args):
@@ -810,7 +1014,14 @@ def main(argv: list[str] | None = None) -> None:
         if args.enrich_authors:
             enrich_authors_existing()
             continue
-        mode = "full" if args.full else ("incremental" if args.incremental else None)
+        if args.full:
+            mode = "full"
+        elif args.through_latest:
+            mode = "through-latest"
+        elif args.incremental:
+            mode = "incremental"
+        else:
+            mode = None
         export(mode=mode, fresh=args.fresh)
     # Author enrichment rewrites the combined CSV in place. A pull writes
     # data/{slug}/ first, so those folders are merged only after every category.

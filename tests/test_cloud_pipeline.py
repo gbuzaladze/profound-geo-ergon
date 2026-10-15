@@ -1,13 +1,11 @@
-"""Verify SQL-backed citation refreshes and the cloud orchestration adapter."""
+"""Verify SQL-backed citation refreshes."""
 
 from __future__ import annotations
 
 import unittest
 from contextlib import contextmanager
-from types import SimpleNamespace
 from unittest.mock import patch
 
-from pipeline.cloud import run_country
 from pipeline.raw_citations import run_incremental_sql
 
 
@@ -36,42 +34,6 @@ class SqlIncrementalCitationTests(unittest.TestCase):
         self.assertEqual(rows, older + refreshed)
         self.assertEqual((answers, api_calls), (2, 1))
         self.assertEqual((start, scan_end), ("2026-09-13", "2026-09-14"))
-
-
-class CloudCountryPipelineTests(unittest.TestCase):
-    def test_cloud_path_disables_csv_output(self) -> None:
-        with (
-            patch(
-                "pipeline.cloud.select_country",
-                return_value=SimpleNamespace(slug="europe-asia"),
-            ) as select,
-            patch(
-                "pipeline.cloud.export_scores",
-                return_value={"table": "fact_scores_summarized"},
-            ) as scores,
-            patch(
-                "pipeline.cloud.export_prompts",
-                return_value={"table": "dim_prompt"},
-            ) as prompts,
-            patch(
-                "pipeline.cloud.export_raw_citations",
-                return_value={"table": "fact_raw_citations"},
-            ) as citations,
-            patch("pipeline.cloud.rebuild_dimensions_from_sql") as dimensions,
-        ):
-            result = run_country("europe-asia")
-
-        select.assert_called_once_with("europe-asia", create_data_dir=False)
-        scores.assert_called_once_with(csv_output=False, rebuild_dimensions=False)
-        prompts.assert_called_once_with(csv_output=False)
-        citations.assert_called_once_with(
-            mode="incremental",
-            csv_output=False,
-            state_source="sql",
-            rebuild_dimensions=False,
-        )
-        dimensions.assert_called_once_with()
-        self.assertEqual(result["country"], "europe-asia")
 
 
 if __name__ == "__main__":

@@ -34,48 +34,6 @@ always pulled. The API key stays in `.env`. Azure SQL credentials stay there
 too; the pipeline writes CSVs under `data/{slug}/` and replaces the same
 tables in schema `{slug}` (`americas-uk-au-uae`, `europe-asia`).
 
-## Scheduled Azure Function
-
-The Azure Durable Function is a separate SQL-only adapter around the same
-pipeline logic. It never creates data CSVs. Each daily run:
-
-1. refreshes the complete scores and prompt tables;
-2. reads the latest citation date from Azure SQL;
-3. pulls citations from that date through yesterday;
-4. combines the new window with older SQL rows;
-5. atomically replaces the complete citation table; and
-6. rebuilds dimensions from both SQL fact tables.
-
-The timer checks hourly on Tuesday and starts one deterministic run after
-6:00 AM Toronto. This keeps the schedule correct across daylight-saving
-changes and catches up later that Tuesday after a temporary outage. Countries
-run sequentially to respect the shared Profound API quota.
-
-The existing CLI commands are unchanged and continue writing CSVs. Azure
-Functions uses managed identity for SQL; local CLI runs can continue using
-`AZURE_SQL_USERNAME` and `AZURE_SQL_PASSWORD`.
-
-Before the first cloud run, load complete citation history into every country
-schema using the CLI. The Function deliberately refuses to increment an empty
-citation table.
-
-Deployment assets are in `infra/` and use Azure Developer CLI:
-
-```powershell
-azd auth login
-azd env new production
-azd env set AZURE_LOCATION canadacentral
-azd env set AZURE_SQL_SERVER your-server.database.windows.net
-azd env set AZURE_SQL_DATABASE your-database
-azd provision
-```
-
-After provisioning, add `PROFOUND_API_KEY` as the `profound-api-key` secret in
-the provisioned Key Vault. In Azure SQL, create a contained Entra user for the
-provisioned Function identity and grant it read, write, and required schema DDL
-permissions. Then validate and deploy with `azd deploy`. Do not place the API
-key or SQL password in Bicep parameters or Function App settings.
-
 ## Reuse for another project
 
 1. Copy this folder (or clone it).
@@ -203,7 +161,12 @@ Pages through V2 Visibility answers and flattens citations to the Citations UI
 columns.
 
 Columns: `date`, `topic`, `platform`, `category`, `mentioned`, `url`,
-`hostname`, `domain`, `path`, `author`, `tags`, `region`.
+`hostname`, `domain`, `path`, `author`, `prompt`, `tags`, `region`.
+`prompt` is the Visibility question and sits immediately before `tags`.
+Rows already stored before `prompt` was added stay blank until that date
+is pulled again. A `--through-latest` citations run re-pulls `START_DATE`
+through the latest date already in `dbo.fact_raw_citations` for that
+category, so the scan does not extend to yesterday.
 `category` is a display label (`earned_media` → `Earned Media`;
 `earned_institutions` → `Institutions`). Hostnames or domains listed in
 `owned_citation_hosts`, or containing a string in `owned_citation_contains`,
@@ -268,6 +231,15 @@ and start over:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pipeline.raw_citations --full --fresh --country americas-uk-au-uae
+```
+
+Re-pull the dates already stored, including `prompt`, without adding days
+through yesterday:
+
+```powershell
+$env:PYTHONPATH = "src"
+$env:PYTHONUNBUFFERED = "1"
+.\.venv\Scripts\python.exe -m pipeline.raw_citations --through-latest
 ```
 
 ### Incremental pull

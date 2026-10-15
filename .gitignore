@@ -1,6 +1,5 @@
-# Local credentials and Azure Functions settings
+# Local credentials
 .env
-local.settings.json
 
 # Python environments, caches, and build outputs
 .venv/
