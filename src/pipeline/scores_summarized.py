@@ -9,6 +9,7 @@ left-joined onto the visibility cube; missing cells stay blank (not 0).
 from __future__ import annotations
 
 import argparse
+import csv
 from time import perf_counter
 
 import profound
@@ -29,6 +30,8 @@ from pipeline.config import (
     lookback_start,
     owned_asset,
     owned_asset_names,
+    project_root,
+    region_for_country,
     select_country,
 )
 from pipeline.db import dedupe_score_rows
@@ -42,15 +45,20 @@ RANK_METRICS: tuple[str, ...] = (
     "share_of_voice",
     "average_position",
 )
-# Warehouse columns before asset. Region is the country inside one category.
-SCORE_DIMENSIONS = ("date", "region", "topic", "platform")
-# Profound names the LLM "model"; the warehouse column is platform.
+# Warehouse grain before asset. Profound's region is stored as country.
+# The screenshot region is derived and is not part of the grain.
+SCORE_DIMENSIONS = ("date", "country", "topic", "platform")
+# Profound names the LLM "model" and the country "region".
 VISIBILITY_GROUP_BY = ("date", "model", "topic", "region")
 # Sentiment accepts date plus two other dimensions, so topic is a filter.
 SENTIMENT_GROUP_BY = ("date", "region", "model")
 SENTIMENT_FILTERS_TOPIC = True
 FIELDNAMES = [
-    *SCORE_DIMENSIONS,
+    "date",
+    "country",
+    "region",
+    "topic",
+    "platform",
     "asset",
     "is_owned",
     "visibility",
@@ -67,8 +75,12 @@ def flatten_record(record: object) -> dict[str, object]:
     """Map one summarized visibility record to export columns."""
     asset = getattr(record, "asset", None)
     name = ref_name(asset)
+    # Profound calls this dimension region. The warehouse column is country.
+    country = ref_name(getattr(record, "region", None))
     row = {
         "date": getattr(record, "date", None),
+        "country": country,
+        "region": region_for_country(country) or None,
         "topic": ref_name(getattr(record, "topic", None)),
         # Profound calls the LLM "model"; the warehouse column is platform.
         "platform": ref_name(getattr(record, "model", None)),
@@ -79,8 +91,6 @@ def flatten_record(record: object) -> dict[str, object]:
         "average_position": getattr(record, "average_position", None),
         "positive_sentiment": None,
     }
-    if "region" in SCORE_DIMENSIONS:
-        row["region"] = ref_name(getattr(record, "region", None))
     return row
 
 
@@ -179,11 +189,14 @@ def zero_fill(
         for asset in assets:
             row = existing.get((*slice_key, asset))
             if row is not None:
+                if not str(row.get("region") or "").strip():
+                    row["region"] = region_for_country(context["country"]) or None
                 filled.append(row)
                 continue
             filled.append(
                 {
                     **context,
+                    "region": region_for_country(context["country"]) or None,
                     "asset": asset,
                     "is_owned": owned_by_asset.get(asset, False),
                     "visibility": 0.0,
@@ -204,16 +217,32 @@ def _sort_dir(metric: str) -> str:
 
 
 def list_topic_names(client: Profound) -> tuple[list[str], int]:
-    """Return active topic names and the API-call count used to list them."""
+    """Return topic names and the API-call count used to list them.
+
+    Active topics are used when any exist. A category whose topics are all
+    disabled still has visibility history, so those names are used instead.
+    """
     response = call_api(client.organizations.categories.topics, category_id())
-    names = sorted(
-        item.name
-        for item in response
-        if item.name and getattr(item, "status", "active") == "active"
-    )
-    if not names:
-        raise SystemExit("No active topics were returned for this category.")
-    return names, 1
+    active: list[str] = []
+    disabled: list[str] = []
+    for item in response:
+        name = getattr(item, "name", None)
+        if not name:
+            continue
+        status = getattr(item, "status", "active")
+        if status == "disabled":
+            disabled.append(name)
+        elif status == "active":
+            active.append(name)
+    if active:
+        return sorted(active), 1
+    if disabled:
+        print(
+            f"No active topics; using {len(disabled)} disabled topics.",
+            flush=True,
+        )
+        return sorted(disabled), 1
+    raise SystemExit("No active topics were returned for this category.")
 
 
 def rank_metric(
@@ -267,6 +296,40 @@ def rank_metric(
     return ranked, api_calls
 
 
+def _sentiment_assets_from_scores() -> list[tuple[str, bool]]:
+    """Return brands that already have sentiment in the combined scores file.
+
+    Profound's asset catalog can be empty while sentiment queries still work.
+    The previous export's non-blank positive_sentiment values are that catalog.
+    """
+    path = project_root() / "data" / "fact_scores_summarized.csv"
+    if not path.is_file():
+        return []
+    found: dict[str, tuple[str, bool]] = {}
+    with path.open(newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            name = str(row.get("asset") or "").strip()
+            if not name:
+                continue
+            has_sentiment = str(row.get("positive_sentiment") or "").strip() != ""
+            owned = str(row.get("is_owned") or "").strip().casefold() in {
+                "true",
+                "1",
+                "yes",
+            } or is_owned_name(name)
+            if not has_sentiment and not owned:
+                continue
+            current = found.get(name.casefold())
+            if current is None:
+                found[name.casefold()] = (name, owned)
+            elif owned and not current[1]:
+                found[name.casefold()] = (current[0], True)
+    primary = owned_asset()
+    if primary.casefold() not in found:
+        found[primary.casefold()] = (primary, True)
+    return list(found.values())
+
+
 def list_category_assets(client: Profound) -> tuple[list[tuple[str, bool]], int]:
     """Return tracked category assets as (name, owned) pairs."""
     items = call_api(client.organizations.categories.assets, category_id())
@@ -275,6 +338,14 @@ def list_category_assets(client: Profound) -> tuple[list[tuple[str, bool]], int]
         for item in items
         if getattr(item, "name", None)
     ]
+    if not assets:
+        assets = _sentiment_assets_from_scores()
+        if assets:
+            print(
+                f"No category assets returned; using {len(assets)} brands "
+                "that already have sentiment.",
+                flush=True,
+            )
     if not assets:
         raise SystemExit("No category assets were returned.")
     return assets, 1
@@ -306,7 +377,7 @@ def _sentiment_key(
     """
     row = {
         "date": str(getattr(record, "date", "") or ""),
-        "region": ref_name(getattr(record, "region", None)),
+        "country": ref_name(getattr(record, "region", None)),
         "topic": (
             topic
             if topic is not None
@@ -431,7 +502,7 @@ def fetch_sentiment(
     values: dict[tuple[str, ...], float] = {}
     api_calls = 0
     # Sentiment's two non-date dimensions are already used when the grain
-    # includes region, so topic is applied as a filter instead.
+    # includes country (Profound's region), so topic is applied as a filter.
     if SENTIMENT_FILTERS_TOPIC:
         topics, topic_calls = list_topic_names(client)
         api_calls += topic_calls

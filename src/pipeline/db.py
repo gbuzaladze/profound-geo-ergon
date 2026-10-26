@@ -1,7 +1,7 @@
 """Load pipeline tables into the single dbo schema.
 
 Both Profound categories write the same dbo tables. A category export replaces
-only the rows for its own regions; the other category stays. Dimension tables
+only the rows for its own countries; the other category stays. Dimension tables
 are rebuilt from both facts. `load_date` is America/Toronto wall time
 (DATETIME2, no offset). Citations have no primary key (duplicate rows are
 valid). Scores collapse case-variant asset names before insert because Azure
@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from mssql_python import connect
 
-from pipeline.config import active_country, project_root
+from pipeline.config import COUNTRY_REGION_PAIRS, active_country, project_root
 
 # Bulk copy: 5k rows per TDS batch; 1 hour covers the large citation CSVs.
 _BULK_BATCH_SIZE = 5000
@@ -60,7 +60,7 @@ _FLOAT_COLUMNS = frozenset(
 )
 
 _SCORES_TABLE = "fact_scores_summarized"
-# Both categories share dbo. Country is the region column, not a schema.
+# Both categories share dbo. Country is the market. Region is APAC, Americas, or Europe.
 SQL_SCHEMA = "dbo"
 # Category exports replace their own slice. Dimension tables are a full rebuild.
 _SLICE_TABLES = frozenset({_SCORES_TABLE, "fact_raw_citations", "dim_prompt"})
@@ -74,6 +74,7 @@ LOAD_TZ = ZoneInfo("America/Toronto")
 TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     _SCORES_TABLE: (
         ("date", "DATE NOT NULL"),
+        ("country", "NVARCHAR(200) NOT NULL"),
         ("region", "NVARCHAR(200) NOT NULL"),
         ("topic", "NVARCHAR(200) NOT NULL"),
         ("platform", "NVARCHAR(200) NOT NULL"),
@@ -98,6 +99,7 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("author", "NVARCHAR(200) NULL"),
         ("prompt", "NVARCHAR(MAX) NULL"),
         ("tags", "NVARCHAR(MAX) NULL"),
+        ("country", "NVARCHAR(200) NULL"),
         ("region", "NVARCHAR(200) NULL"),
         _LOAD_DATE_DDL,
     ),
@@ -112,12 +114,15 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     "dim_date": (("date", "DATE NOT NULL"), _LOAD_DATE_DDL),
     "dim_topic": (("topic", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
     "dim_platform": (("platform", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
+    "dim_country": (("country", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
     "dim_region": (("region", "NVARCHAR(200) NOT NULL"), _LOAD_DATE_DDL),
 }
 
 # Text grain columns are matched case-insensitively. date is not folded.
-# Region is the country inside a multi-country Profound category.
-_SCORE_GRAIN = ("date", "region", "topic", "platform", "asset")
+# Country is the market inside a multi-country Profound category.
+# Region is derived from country and is not part of the primary key.
+_SCORE_GRAIN = ("date", "country", "topic", "platform", "asset")
+_GEOGRAPHY_TABLES = frozenset({_SCORES_TABLE, "fact_raw_citations"})
 # Slicer dims are dim_{column}, except dim_prompt which is a prompt snapshot.
 _SLICER_DIMENSIONS = {
     table: table.removeprefix("dim_")
@@ -287,8 +292,8 @@ def _table_column_sql(table: str) -> str:
 def ensure_schema_and_tables(cursor, schema: str) -> None:
     """Create the schema, if needed, and the reporting tables when they are missing.
 
-    Existing tables are not rebuilt, except `fact_raw_citations` when its
-    columns differ from TABLES (for example `prompt` missing or out of order).
+    Existing fact tables rename `region` to `country` and add `region` beside
+    it. Tables whose column order differs from TABLES are copied into order.
     A new `prompt` stays null until the next citation load. Narrow text
     columns are widened in place, and `load_date` is added when absent.
     """
@@ -313,8 +318,9 @@ def ensure_schema_and_tables(cursor, schema: str) -> None:
         )
         _widen_existing_text_columns(cursor, schema, table)
         _ensure_load_date_column(cursor, schema, table)
-        if table == "fact_raw_citations":
-            _ensure_citation_prompt_column(cursor, schema)
+        _ensure_country_and_region(cursor, schema, table)
+        _ensure_column_order(cursor, schema, table)
+        _ensure_primary_key(cursor, schema, table)
         if table in _DATE_INDEXED:
             # Nonclustered date index for Power BI / slicer filters on large facts.
             index_name = f"IX_{table}_date"
@@ -414,18 +420,117 @@ def _swap_reordered_table(cursor, schema: str, table: str, staging: str) -> None
     cursor.execute(f"EXEC sp_rename N'{schema}.{staging}', N'{table}'")
 
 
-def _ensure_citation_prompt_column(cursor, schema: str) -> None:
-    """Put `prompt` immediately before `tags` on an existing citations table.
+def _sql_nvarchar(value: str) -> str:
+    """Quote a string as an NVARCHAR literal."""
+    return "N'" + value.replace("'", "''") + "'"
 
-    SQL Server appends new columns, so a table created before `prompt` is
-    copied into a new table with the current column order. Rows keep their
-    existing values; a missing `prompt` stays null until the next citation load.
+
+def _region_case_sql() -> str:
+    """CASE expression that maps a country name to its screenshot region."""
+    branches = " ".join(
+        f"WHEN {_sql_nvarchar(country)} THEN {_sql_nvarchar(region)}"
+        for country, region in COUNTRY_REGION_PAIRS
+    )
+    return f"CASE LTRIM(RTRIM([country])) {branches} ELSE NULL END"
+
+
+def _drop_primary_key(cursor, schema: str, table: str) -> None:
+    """Drop the table primary key when one exists."""
+    cursor.execute(
+        """
+        SELECT kc.[name]
+        FROM sys.key_constraints AS kc
+        WHERE kc.[type] = 'PK'
+          AND kc.[parent_object_id] = OBJECT_ID(?)
+        """,
+        (f"{schema}.{table}",),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return
+    cursor.execute(
+        f"ALTER TABLE {_qualified(schema, table)} DROP CONSTRAINT [{row[0]}]"
+    )
+
+
+def _ensure_country_and_region(cursor, schema: str, table: str) -> None:
+    """Rename the old country column and fill region from the country map.
+
+    Existing databases stored the Profound country in `region`. That column
+    becomes `country`, and `region` is added for APAC, Americas, and Europe.
+    Rows already on the new columns are left in place; only a blank region is
+    filled.
     """
-    table = "fact_raw_citations"
+    if table not in _GEOGRAPHY_TABLES:
+        return
+    names = {name.casefold() for name in _table_column_names(cursor, schema, table)}
+    if not names:
+        return
+    if "country" not in names and "region" in names:
+        # The old primary key is on region. Drop it before the rename so the
+        # rebuilt table can use country as the grain.
+        _drop_primary_key(cursor, schema, table)
+        cursor.execute(
+            f"EXEC sp_rename N'{schema}.{table}.region', N'country', N'COLUMN'"
+        )
+        print(f"  [{schema}].[{table}]: renamed region to country", flush=True)
+        names.add("country")
+        names.discard("region")
+    if "country" not in names:
+        return
+    if "region" not in names:
+        cursor.execute(
+            f"ALTER TABLE {_qualified(schema, table)} ADD [region] NVARCHAR(200) NULL"
+        )
+        print(f"  [{schema}].[{table}]: added region next to country", flush=True)
+    cursor.execute(
+        f"""
+        UPDATE {_qualified(schema, table)}
+        SET [region] = {_region_case_sql()}
+        WHERE [region] IS NULL
+          AND [country] IS NOT NULL
+          AND LTRIM(RTRIM([country])) <> N''
+        """
+    )
+    cursor.execute(
+        f"""
+        SELECT DISTINCT LTRIM(RTRIM([country]))
+        FROM {_qualified(schema, table)}
+        WHERE [region] IS NULL
+          AND [country] IS NOT NULL
+          AND LTRIM(RTRIM([country])) <> N''
+        """
+    )
+    unmapped = sorted({str(row[0]) for row in cursor.fetchall() if row[0]})
+    if unmapped:
+        joined = ", ".join(unmapped)
+        raise SystemExit(
+            f"[{schema}].[{table}] has no region for: {joined}. "
+            "Add them under [regions] in project.toml."
+        )
+    region_ddl = next(ddl for name, ddl in TABLES[table] if name == "region")
+    if "NOT NULL" in region_ddl:
+        cursor.execute(
+            f"""
+            UPDATE {_qualified(schema, table)}
+            SET [region] = N''
+            WHERE [region] IS NULL
+            """
+        )
+
+
+def _ensure_column_order(cursor, schema: str, table: str) -> None:
+    """Rebuild a table when its columns are not in TABLES order.
+
+    SQL Server appends new columns, so `region` would land after `load_date`
+    unless the table is copied. Rows keep values for columns that already
+    exist. A missing column, such as `prompt` on older citations, stays null.
+    """
     desired = _columns(table)
     actual = _table_column_names(cursor, schema, table)
-    if _columns_match(actual, desired):
+    if not actual or _columns_match(actual, desired):
         return
+    print(f"  [{schema}].[{table}]: rebuilding column order", flush=True)
     staging, qualified_stage = _stage_reordered_table(cursor, schema, table)
     present = {name.casefold() for name in actual}
     shared = [name for name in desired if name.casefold() in present]
@@ -436,6 +541,29 @@ def _ensure_citation_prompt_column(cursor, schema: str) -> None:
             f"SELECT {cols} FROM {_qualified(schema, table)}"
         )
     _swap_reordered_table(cursor, schema, table, staging)
+
+
+def _ensure_primary_key(cursor, schema: str, table: str) -> None:
+    """Add the primary key when the table was rebuilt without one."""
+    key = _PRIMARY_KEYS.get(table)
+    if not key:
+        return
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sys.key_constraints
+        WHERE [type] = 'PK'
+          AND [parent_object_id] = OBJECT_ID(?)
+        """,
+        (f"{schema}.{table}",),
+    )
+    if cursor.fetchone() is not None:
+        return
+    columns = ", ".join(f"[{name}]" for name in key)
+    cursor.execute(
+        f"ALTER TABLE {_qualified(schema, table)} "
+        f"ADD CONSTRAINT [PK_{table}] PRIMARY KEY ({columns})"
+    )
 
 
 # Value conversion
@@ -702,12 +830,12 @@ def _rewrite_csv_load_date(path: Path, table: str, load_at: datetime) -> None:
     temp_path.replace(path)
 
 
-def _category_regions() -> list[str]:
+def _category_countries() -> list[str]:
     """Return the countries named on the active Profound category."""
     country = active_country()
-    if not country.regions:
-        raise SystemExit(f"{country.slug} has no regions in its name.")
-    return list(country.regions)
+    if not country.countries:
+        raise SystemExit(f"{country.slug} has no countries in its name.")
+    return list(country.countries)
 
 
 def _placeholders(count: int) -> str:
@@ -752,11 +880,11 @@ def _apply_staged_rows(
             f"""
             DELETE target
             FROM {qualified} AS target
-            WHERE target.[region] IN (
-                SELECT DISTINCT staged.[region]
+            WHERE target.[country] IN (
+                SELECT DISTINCT staged.[country]
                 FROM {qualified_stage} AS staged
-                WHERE staged.[region] IS NOT NULL
-                  AND LTRIM(RTRIM(staged.[region])) <> ''
+                WHERE staged.[country] IS NOT NULL
+                  AND LTRIM(RTRIM(staged.[country])) <> ''
             )
             """
         )
@@ -892,11 +1020,11 @@ def settings_label() -> str:
 
 
 def latest_table_date(table: str) -> str:
-    """Return the latest date for the active category's regions in dbo."""
+    """Return the latest date for the active category's countries in dbo."""
     if table not in _DATE_INDEXED:
         raise ValueError(f"{table!r} is not a date-indexed fact table.")
-    regions = _category_regions()
-    placeholders = _placeholders(len(regions))
+    countries = _category_countries()
+    placeholders = _placeholders(len(countries))
     with sql_connection() as conn:
         if conn is None:
             raise RuntimeError("Azure SQL must be configured for cloud execution.")
@@ -907,14 +1035,14 @@ def latest_table_date(table: str) -> str:
             f"""
             SELECT MAX([date])
             FROM {_qualified(SQL_SCHEMA, table)}
-            WHERE [region] IN ({placeholders})
+            WHERE [country] IN ({placeholders})
             """,
-            tuple(regions),
+            tuple(countries),
         )
         row = cursor.fetchone()
     value = None if row is None else row[0]
     if value is None:
-        names = ", ".join(regions)
+        names = ", ".join(countries)
         raise RuntimeError(
             f"[{SQL_SCHEMA}].[{table}] has no dated rows for {names}. "
             "Run a full CLI load first."
@@ -926,21 +1054,23 @@ def read_rows_before(table: str, before_date: str) -> list[dict[str, Any]]:
     """Read this category's rows older than a date from the combined dbo table."""
     if table not in _DATE_INDEXED:
         raise ValueError(f"{table!r} is not a date-indexed fact table.")
-    regions = _category_regions()
-    placeholders = _placeholders(len(regions))
+    countries = _category_countries()
+    placeholders = _placeholders(len(countries))
     fields = _grain_columns(table)
     columns = ", ".join(f"[{name}]" for name in fields)
     with sql_connection() as conn:
         if conn is None:
             raise RuntimeError("Azure SQL must be configured for cloud execution.")
         cursor = conn.cursor()
+        ensure_schema_and_tables(cursor, SQL_SCHEMA)
+        conn.commit()
         cursor.execute(
             f"""
             SELECT {columns}
             FROM {_qualified(SQL_SCHEMA, table)}
-            WHERE [date] < ? AND [region] IN ({placeholders})
+            WHERE [date] < ? AND [country] IN ({placeholders})
             """,
-            (before_date, *regions),
+            (before_date, *countries),
         )
         rows = cursor.fetchall()
     return [dict(zip(fields, row, strict=True)) for row in rows]

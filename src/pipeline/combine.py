@@ -3,7 +3,7 @@
 Each Profound category is written under data/{slug}/ during the pull. This
 module merges those files into data/ and then removes the category folders.
 Refreshing one category keeps the other category's rows already in data/,
-matched by region.
+matched by country. Legacy files stored that country in `region`.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from pipeline.common import replace_file, write_csv
-from pipeline.config import COUNTRIES, project_root
+from pipeline.config import COUNTRIES, apply_geography, geography_from_row, project_root
 from pipeline.dims import DIM_COLUMNS, collect_dim_keys
 
 SCORE_FILE = "fact_scores_summarized.csv"
@@ -73,23 +73,26 @@ def concat_csvs(sources: list[Path], destination: Path) -> int:
     return written
 
 
-def _regions_in(paths: list[Path]) -> set[str]:
-    regions: set[str] = set()
+def _countries_in(paths: list[Path]) -> set[str]:
+    """Return country names present in these fact files."""
+    countries: set[str] = set()
     for path in paths:
         with path.open(newline="", encoding="utf-8") as file:
             for row in csv.DictReader(file):
-                region = str(row.get("region") or "").strip()
-                if region:
-                    regions.add(region)
-    return regions
+                country, _region = geography_from_row(row)
+                if country:
+                    countries.add(country)
+    return countries
 
 
 def _write_merged_fact(
-    sources: list[Path], destination: Path, replaced_regions: set[str]
+    sources: list[Path], destination: Path, replaced_countries: set[str]
 ) -> int:
-    """Keep combined rows whose region was not in this pull, then append new rows.
+    """Keep combined rows whose country was not in this pull, then append new rows.
 
-    A blank region is not treated as a refreshed country, so those rows stay.
+    A blank country is not treated as refreshed, so those rows stay. Legacy
+    rows that stored the country in `region` are rewritten with country and
+    the screenshot region.
     """
     fieldnames = _header(sources[0])
     written = 0
@@ -97,15 +100,15 @@ def _write_merged_fact(
         if destination.is_file():
             with destination.open(newline="", encoding="utf-8") as existing:
                 for row in csv.DictReader(existing):
-                    region = str(row.get("region") or "").strip()
-                    if region in replaced_regions:
+                    country, _region = geography_from_row(row)
+                    if country in replaced_countries:
                         continue
-                    writer.writerow(row)
+                    writer.writerow(apply_geography(row))
                     written += 1
         for path in sources:
             with path.open(newline="", encoding="utf-8") as in_file:
                 for row in csv.DictReader(in_file):
-                    writer.writerow(row)
+                    writer.writerow(apply_geography(row))
                     written += 1
     return written
 
@@ -148,9 +151,9 @@ def _category_sources(filename: str) -> list[Path]:
 
 
 def _merge_fact(sources: list[Path], destination: Path, label: str) -> int:
-    """Replace combined rows for regions in this pull and keep the other category."""
-    replaced_regions = _regions_in(sources)
-    rows = _write_merged_fact(sources, destination, replaced_regions)
+    """Replace combined rows for countries in this pull and keep the other category."""
+    replaced_countries = _countries_in(sources)
+    rows = _write_merged_fact(sources, destination, replaced_countries)
     print(f"Combined {label} written to {destination}: {rows} rows")
     return rows
 

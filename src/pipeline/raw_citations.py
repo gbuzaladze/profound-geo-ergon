@@ -39,13 +39,16 @@ from pipeline.config import (
     START_DATE,
     active_country,
     add_country_option,
+    apply_geography,
     category_id,
     countries_from_args,
     data_dir,
     drop_incomplete_dates,
     end_date,
+    geography_from_row,
     is_owned_citation_host,
     project_root,
+    region_for_country,
     select_country,
 )
 from pipeline.dims import publish_dimensions
@@ -89,6 +92,7 @@ FIELDNAMES = [
     "author",
     "prompt",
     "tags",
+    "country",
     "region",
 ]
 # Citations UI is Visibility only; other analysis types are out of scope.
@@ -219,10 +223,16 @@ def citation_row(
     path: object,
     prompt: object,
     tags: object,
-    region: object,
+    country: object,
 ) -> dict[str, object]:
-    """Build one export row, deriving domain from hostname and author from URL."""
+    """Build one export row, deriving domain from hostname and author from URL.
+
+    `country` is Profound's region. `region` is the screenshot grouping.
+    """
     domain = domain_from_hostname(hostname)
+    name = country.strip() if isinstance(country, str) else country
+    if isinstance(name, str) and not name:
+        name = None
     return {
         "date": day,
         "topic": topic,
@@ -236,7 +246,8 @@ def citation_row(
         "author": author_from_url(url, hostname),
         "prompt": prompt,
         "tags": tags,
-        "region": region,
+        "country": name,
+        "region": region_for_country(name) or None,
     }
 
 
@@ -303,7 +314,7 @@ def flatten_answer(answer: object) -> list[dict[str, object]]:
                     path=item.get("path"),
                     tags=tags,
                     prompt=prompt,
-                    region=region,
+                    country=region,
                 )
             )
         return rows
@@ -324,16 +335,17 @@ def flatten_answer(answer: object) -> list[dict[str, object]]:
                 path=urlparse(url).path or None,
                 tags=tags,
                 prompt=prompt,
-                region=region,
+                country=region,
             )
         )
     return rows
 
 
-def sort_key(row: dict[str, object]) -> tuple[str, str, str, str]:
-    """Sort ascending by date, region, topic, then platform."""
+def sort_key(row: dict[str, object]) -> tuple[str, str, str, str, str]:
+    """Sort ascending by date, country, region, topic, then platform."""
     return (
         str(row.get("date") or ""),
+        str(row.get("country") or ""),
         str(row.get("region") or ""),
         str(row.get("topic") or ""),
         str(row.get("platform") or ""),
@@ -615,8 +627,9 @@ def _restore_category_citations() -> None:
     """Copy this category's rows out of the combined citation CSV.
 
     A finished pull merges data/{slug}/ into data/ and deletes the category
-    folder. The next incremental run needs those rows back. Region names are
-    the comma-separated countries on the category.
+    folder. The next incremental run needs those rows back. Country names are
+    the comma-separated countries on the category. Older files stored that
+    country in `region`.
     """
     path = output_path()
     if path.is_file():
@@ -624,14 +637,14 @@ def _restore_category_citations() -> None:
     combined = project_root() / "data" / "fact_raw_citations.csv"
     if not combined.is_file():
         return
-    regions = set(active_country().regions)
+    countries = set(active_country().countries)
     with combined.open(newline="", encoding="utf-8") as file:
         reader = csv.DictReader(file)
         fieldnames = list(reader.fieldnames or [])
         rows = [
             row
             for row in reader
-            if (row.get("region") or "").strip() in regions
+            if geography_from_row(row)[0] in countries
         ]
     if not rows or not fieldnames:
         return
@@ -709,35 +722,37 @@ def scan_end_through_latest(latest: str, *, yesterday: str | None = None) -> str
 
 
 def citation_table_max_date() -> str:
-    """Return MAX(date) for this category's regions in dbo.fact_raw_citations.
+    """Return MAX(date) for this category's countries in dbo.fact_raw_citations.
 
-    This does not migrate the table. Schema changes wait until the replacement
-    load so a long pull is not preceded by a full copy of the existing rows.
+    Ensures country and region first so the filter column exists. On an old
+    database that copy runs before the pull.
     """
-    from pipeline.db import SQL_SCHEMA, sql_connection
+    from pipeline.db import SQL_SCHEMA, ensure_schema_and_tables, sql_connection
 
-    regions = list(active_country().regions)
-    if not regions:
-        raise SystemExit(f"{active_country().slug} has no regions in its name.")
-    placeholders = ", ".join("?" for _ in regions)
+    countries = list(active_country().countries)
+    if not countries:
+        raise SystemExit(f"{active_country().slug} has no countries in its name.")
+    placeholders = ", ".join("?" for _ in countries)
     with sql_connection() as conn:
         if conn is None:
             raise SystemExit(
                 "Azure SQL must be configured to read the latest citation date."
             )
         cursor = conn.cursor()
+        ensure_schema_and_tables(cursor, SQL_SCHEMA)
+        conn.commit()
         cursor.execute(
             f"""
             SELECT MAX([date])
             FROM [{SQL_SCHEMA}].[fact_raw_citations]
-            WHERE [region] IN ({placeholders})
+            WHERE [country] IN ({placeholders})
             """,
-            tuple(regions),
+            tuple(countries),
         )
         row = cursor.fetchone()
     value = None if row is None else row[0]
     if value is None:
-        names = ", ".join(regions)
+        names = ", ".join(countries)
         raise SystemExit(
             f"[{SQL_SCHEMA}].[fact_raw_citations] has no dated rows for {names}. "
             "Run a --full pull first."
@@ -754,7 +769,7 @@ def _author_restore_key(row: Mapping[str, object]) -> tuple[str, str, str, str, 
         day = day.isoformat()
     return (
         str(day or "")[:10],
-        str(row.get("region") or ""),
+        str(row.get("country") or ""),
         str(row.get("topic") or ""),
         str(row.get("platform") or ""),
         str(row.get("url") or ""),
@@ -768,39 +783,41 @@ def load_saved_authors() -> dict[tuple[str, str, str, str, str], list[str]]:
     an earlier run. A prompt backfill turns that lookup off, then puts these
     authors back on rows the new pull left blank.
     """
-    from pipeline.db import SQL_SCHEMA, sql_connection
+    from pipeline.db import SQL_SCHEMA, ensure_schema_and_tables, sql_connection
 
-    regions = list(active_country().regions)
-    if not regions:
-        raise SystemExit(f"{active_country().slug} has no regions in its name.")
-    placeholders = ", ".join("?" for _ in regions)
+    countries = list(active_country().countries)
+    if not countries:
+        raise SystemExit(f"{active_country().slug} has no countries in its name.")
+    placeholders = ", ".join("?" for _ in countries)
     with sql_connection() as conn:
         if conn is None:
             raise SystemExit(
                 "Azure SQL must be configured to keep existing citation authors."
             )
         cursor = conn.cursor()
+        ensure_schema_and_tables(cursor, SQL_SCHEMA)
+        conn.commit()
         cursor.execute(
             f"""
-            SELECT [date], [region], [topic], [platform], [url], [author]
+            SELECT [date], [country], [topic], [platform], [url], [author]
             FROM [{SQL_SCHEMA}].[fact_raw_citations]
             WHERE [author] IS NOT NULL AND [author] <> N''
-              AND [region] IN ({placeholders})
+              AND [country] IN ({placeholders})
               AND (
                 [hostname] LIKE N'%instagram.com'
                 OR [hostname] LIKE N'%youtube.com'
                 OR [hostname] LIKE N'%youtu.be'
               )
             """,
-            tuple(regions),
+            tuple(countries),
         )
         fetched = cursor.fetchall()
     pool: dict[tuple[str, str, str, str, str], list[str]] = {}
-    for day, region, topic, platform, url, author in fetched:
+    for day, country, topic, platform, url, author in fetched:
         key = _author_restore_key(
             {
                 "date": day,
-                "region": region,
+                "country": country,
                 "topic": topic,
                 "platform": platform,
                 "url": url,
@@ -865,7 +882,11 @@ def export(
         raise ValueError("state_source must be 'csv' or 'sql'.")
     if state_source == "sql" and mode != "incremental":
         raise ValueError("SQL-backed citation exports must use incremental mode.")
-    resolved = mode or ("incremental" if output_path().exists() else "full")
+    # Category folders are deleted after combine, so the combined citation file
+    # is the incremental checkpoint for the next run.
+    combined_citations = project_root() / "data" / "fact_raw_citations.csv"
+    already_exported = output_path().is_file() or combined_citations.is_file()
+    resolved = mode or ("incremental" if already_exported else "full")
     print(f"Mode: {resolved}", flush=True)
     # A prompt backfill rewrites citations only. Dimensions stay as they are.
     if resolved == "through-latest":
@@ -902,6 +923,7 @@ def export(
             f"Restored {restored} authors from the existing citation table.",
             flush=True,
         )
+    rows = [apply_geography(row) for row in rows]
     rows.sort(key=sort_key)
     destination = publish_table(
         rows,
@@ -920,7 +942,7 @@ def export(
     print(f"Runtime: {minutes:.1f} minutes; API calls: {api_calls}")
     print(f"Answers scanned: {answers_scanned}")
     print(f"Scan window: {start} through {scan_end}")
-    print("Sorted by: date, region, topic, platform")
+    print("Sorted by: date, country, region, topic, platform")
     print("Prompt type filter: visibility")
     return {
         "table": "fact_raw_citations",
@@ -982,6 +1004,7 @@ def enrich_authors_existing() -> dict[str, object]:
     print(f"Author fill after: {_author_fill_summary(after)}", flush=True)
 
     rows = apply_category_rules(rows)
+    rows = [apply_geography(row) for row in rows]
     rows.sort(key=sort_key)
     destination = publish_table(
         rows, path=path, fieldnames=FIELDNAMES, csv_output=True

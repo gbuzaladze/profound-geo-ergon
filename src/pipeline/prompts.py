@@ -52,19 +52,20 @@ def flatten_prompt(item: object) -> dict[str, object]:
     }
 
 
-def fetch_prompts(client: Profound) -> tuple[list[dict[str, object]], int]:
-    """Page through active Visibility prompts for this category."""
+def _page_prompts(
+    client: Profound, status: list[str]
+) -> tuple[list[dict[str, object]], int]:
+    """Page Visibility prompts with one status filter."""
     rows: list[dict[str, object]] = []
     cursor: str | None = None
     api_calls = 0
     while True:
         api_calls += 1
-        # Active Visibility prompts only; retired prompts are omitted.
         response = call_api(
             client.organizations.categories.prompts,
             category_id(),
             analysis_type=["visibility"],
-            status=["active"],
+            status=status,
             order_by="prompt",
             order_dir="asc",
             limit=PAGE_SIZE,
@@ -80,13 +81,27 @@ def fetch_prompts(client: Profound) -> tuple[list[dict[str, object]], int]:
     return rows, api_calls
 
 
+def fetch_prompts(client: Profound) -> tuple[list[dict[str, object]], int]:
+    """Page through Visibility prompts for this category.
+
+    Active prompts are used when any exist. If the category has only disabled
+    prompts, those are exported so the snapshot still matches Profound.
+    """
+    rows, api_calls = _page_prompts(client, ["active"])
+    if rows:
+        return rows, api_calls
+    print("No active visibility prompts; loading disabled prompts.", flush=True)
+    disabled, disabled_calls = _page_prompts(client, ["disabled"])
+    return disabled, api_calls + disabled_calls
+
+
 def export(*, csv_output: bool = True) -> dict[str, object]:
     """Replace active prompts in SQL, optionally retaining the local CSV output."""
     started = perf_counter()
     with profound_client() as client:
         rows, api_calls = fetch_prompts(client)
     if not rows:
-        raise SystemExit("No active visibility prompts were returned.")
+        raise SystemExit("No visibility prompts were returned.")
 
     rows.sort(
         key=lambda row: (str(row.get("topic") or ""), str(row.get("prompt") or ""))

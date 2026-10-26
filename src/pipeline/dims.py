@@ -19,13 +19,14 @@ from pipeline.config import (
 )
 from pipeline.db import rebuild_dimensions_from_sql, sql_is_configured
 
-# Slicer columns present on both facts. Region is the country inside a
-# Profound category that covers several markets.
-DIM_COLUMNS = ("date", "topic", "platform", "region")
+# Slicer columns present on both facts. Country is the Profound market.
+# Region is the screenshot grouping and sits beside country.
+DIM_COLUMNS = ("date", "topic", "platform", "country", "region")
 _DIM_LABELS = {
     "date": "dates",
     "topic": "topics",
     "platform": "platforms",
+    "country": "countries",
     "region": "regions",
 }
 

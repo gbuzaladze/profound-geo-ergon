@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -114,7 +115,8 @@ def _as_slug(value: object, key: str) -> str:
 class Country:
     """One Profound category exported into data/{slug}/.
 
-    Both categories load into schema dbo. Country is the region column.
+    Both categories load into schema dbo. The market is the country column.
+    Region is the screenshot grouping from [regions].
 
     `owned_asset` is the Profound brand name used for dashboard KPIs. A
     country may override the project default when Profound uses a local name.
@@ -130,11 +132,11 @@ class Country:
         return project_root() / "data" / self.slug
 
     @property
-    def regions(self) -> tuple[str, ...]:
-        """Regions covered by this category.
+    def countries(self) -> tuple[str, ...]:
+        """Countries covered by this category.
 
         `name` is a comma-separated country list. Those values are the
-        `region` column used to merge one category into the combined export.
+        `country` column used to merge one category into the combined export.
         """
         return tuple(part.strip() for part in self.name.split(",") if part.strip())
 
@@ -176,6 +178,53 @@ def _load_countries(raw: object, default_owned_asset: str) -> tuple[Country, ...
     return tuple(countries)
 
 
+def _load_region_pairs(raw: object) -> tuple[tuple[str, str], ...]:
+    """Return (country, region) pairs from the [regions] table."""
+    if not isinstance(raw, dict) or not raw:
+        raise SystemExit(f"{_SETTINGS_NAME} needs a [regions] table.")
+    pairs: list[tuple[str, str]] = []
+    seen: dict[str, str] = {}
+    for region, countries in raw.items():
+        region_name = str(region).strip()
+        if not region_name:
+            raise SystemExit(f"{_SETTINGS_NAME} [regions] has an empty region name.")
+        if not isinstance(countries, list) or not countries:
+            raise SystemExit(
+                f"{_SETTINGS_NAME} [regions] {region_name} must list at least one country."
+            )
+        for item in countries:
+            name = str(item).strip()
+            if not name:
+                continue
+            folded = name.casefold()
+            previous = seen.get(folded)
+            if previous is not None and previous != region_name:
+                raise SystemExit(
+                    f"{_SETTINGS_NAME} lists {name} under both {previous} and {region_name}."
+                )
+            if previous is None:
+                seen[folded] = region_name
+                pairs.append((name, region_name))
+    if not pairs:
+        raise SystemExit(f"{_SETTINGS_NAME} [regions] has no countries.")
+    return tuple(pairs)
+
+
+def _require_region_for_configured_countries(
+    countries: tuple[Country, ...], region_by_country: dict[str, str]
+) -> None:
+    """Exit when a category country has no screenshot region."""
+    missing = [
+        f"{country.slug}: {name}"
+        for country in countries
+        for name in country.countries
+        if name.casefold() not in region_by_country
+    ]
+    if missing:
+        joined = ", ".join(missing)
+        raise SystemExit(f"{_SETTINGS_NAME} [regions] is missing {joined}.")
+
+
 # Loaded settings
 
 
@@ -197,6 +246,14 @@ if not ASSET_NAME:
 
 COUNTRIES = _load_countries(_settings.get("countries"), ASSET_NAME)
 _COUNTRIES_BY_SLUG = {country.slug: country for country in COUNTRIES}
+# Country spelling as written in project.toml, paired with its screenshot region.
+COUNTRY_REGION_PAIRS = _load_region_pairs(_settings.get("regions"))
+REGION_BY_COUNTRY = {
+    country.casefold(): region for country, region in COUNTRY_REGION_PAIRS
+}
+REGION_NAMES = tuple(dict.fromkeys(region for _country, region in COUNTRY_REGION_PAIRS))
+_REGION_BY_LABEL = {region.casefold(): region for region in REGION_NAMES}
+_require_region_for_configured_countries(COUNTRIES, REGION_BY_COUNTRY)
 OWNED_ALIASES = _as_name_list(_project.get("owned_aliases"), "owned_aliases")
 OWNED_CITATION_HOSTS = _as_name_list(
     _project.get("owned_citation_hosts"), "owned_citation_hosts"
@@ -222,6 +279,54 @@ _active: Country | None = None
 
 
 # Owned matching and country selection
+
+
+def region_for_country(country: object) -> str:
+    """Return the screenshot region for a Profound country name.
+
+    A blank country returns a blank region. An unknown country stops the run
+    so a new market is not stored without a region.
+    """
+    name = str(country or "").strip()
+    if not name:
+        return ""
+    region = REGION_BY_COUNTRY.get(name.casefold())
+    if region is None:
+        raise SystemExit(
+            f"No region for country {name!r}. Add it under [regions] in {_SETTINGS_NAME}."
+        )
+    return region
+
+
+def geography_from_row(row: Mapping[str, object]) -> tuple[str, str]:
+    """Return (country, region) from a current row or a legacy region-only row.
+
+    Legacy files stored the country in `region`. Once `country` is present,
+    `region` is the screenshot grouping.
+    """
+    raw_country = str(row.get("country") or "").strip()
+    raw_region = str(row.get("region") or "").strip()
+    labeled = _REGION_BY_LABEL.get(raw_region.casefold()) if raw_region else None
+    if raw_country:
+        country = raw_country
+    elif labeled is None:
+        country = raw_region
+    else:
+        country = ""
+    if raw_country and labeled is not None:
+        region = labeled
+    else:
+        region = region_for_country(country)
+    return country, region
+
+
+def apply_geography(row: Mapping[str, object]) -> dict[str, object]:
+    """Copy a row and set country plus the screenshot region."""
+    country, region = geography_from_row(row)
+    updated = dict(row)
+    updated["country"] = country or None
+    updated["region"] = region or None
+    return updated
 
 
 def is_owned_name(name: str | None) -> bool:

@@ -1,13 +1,14 @@
 # Ergon GEO Pipeline
 
 Reusable pipeline: `project.toml` lists one Profound category per entry and
-exports the same tables into a folder for each category. Ergon countries are
-the `region` column on the score fact, not separate categories.
+exports the same tables into a folder for each category. Ergon markets are
+the `country` column. `region` is the screenshot grouping (APAC, Americas,
+Europe) and sits immediately after `country`.
 
-- `data/{slug}/fact_scores_summarized` — daily visibility, share of voice, average position, and positive sentiment, by region
+- `data/{slug}/fact_scores_summarized` — daily visibility, share of voice, average position, and positive sentiment, by country and region
 - `data/{slug}/fact_raw_citations` — one row per citation from Visibility answers
 - `data/{slug}/dim_prompt` — active Visibility prompts in the category
-- `data/{slug}/dim_date`, `dim_topic`, `dim_platform`, `dim_region` — distinct keys from both facts
+- `data/{slug}/dim_date`, `dim_topic`, `dim_platform`, `dim_country`, `dim_region` — distinct keys from both facts
 
 ## Requirements
 
@@ -87,11 +88,12 @@ data/dim_prompt.csv
 data/dim_date.csv
 data/dim_topic.csv
 data/dim_platform.csv
+data/dim_country.csv
 data/dim_region.csv
 ```
 
 Category folders are removed after the two Profound categories are concatenated.
-Country stays on the `region` column.
+Country is the Profound market. Region is APAC, Americas, or Europe.
 
 CSV-only (skip Azure SQL):
 
@@ -113,13 +115,14 @@ $env:PYTHONUNBUFFERED = "1"
 ```
 
 Relate both facts many-to-one to `dim_date[date]`, `dim_topic[topic]`,
-`dim_platform[platform]`, and `dim_region[region]`. Put slicers on the dim
-tables so one filter applies to both facts.
+`dim_platform[platform]`, `dim_country[country]`, and `dim_region[region]`.
+Put slicers on the dim tables so one filter applies to both facts.
 
 ## fact_scores_summarized
 
-Pulls the Visibility Summarized view with **topic** and **region** included
-(date x region x topic x platform x asset). Ranking uses the last `LOOKBACK_DAYS` (default 30) to pick,
+Pulls the Visibility Summarized view with **topic** and Profound's **region**
+(stored as country) included
+(date x country x region x topic x platform x asset). Ranking uses the last `LOOKBACK_DAYS` (default 30) to pick,
 in **each topic**, the top `TOP_N` brands by visibility, by share of voice,
 by average position (lower is better), and by positive sentiment, then unions
 those lists. Sentiment ranking uses tracked category brands (v2 sentiment is
@@ -129,11 +132,12 @@ outside every top N. An `owned_aliases` name is included only when this
 category tracks that exact asset, and those names are marked `is_owned`
 even when Profound tracks them as separate unowned assets.
 
-Columns: `date`, `region`, `topic`, `platform`, `asset`, `is_owned`, `visibility`,
-`share_of_voice`, `average_position`, `positive_sentiment`.
+Columns: `date`, `country`, `region`, `topic`, `platform`, `asset`, `is_owned`,
+`visibility`, `share_of_voice`, `average_position`, `positive_sentiment`.
+`region` is APAC, Americas, or Europe from `[regions]` in `project.toml`.
 
 After the pull, every selected asset is zero-filled for every observed
-`date` × `region` × `topic` × `platform` (`visibility` and `share_of_voice` = 0 when
+`date` × `country` × `topic` × `platform` (`visibility` and `share_of_voice` = 0 when
 absent). `average_position` and `positive_sentiment` stay blank when missing.
 Positive sentiment is merged from a second v2 sentiment pull for category
 brands and stored as a 0–1 share (same scale as visibility). Other brands in
@@ -161,7 +165,7 @@ Pages through V2 Visibility answers and flattens citations to the Citations UI
 columns.
 
 Columns: `date`, `topic`, `platform`, `category`, `mentioned`, `url`,
-`hostname`, `domain`, `path`, `author`, `prompt`, `tags`, `region`.
+`hostname`, `domain`, `path`, `author`, `prompt`, `tags`, `country`, `region`.
 `prompt` is the Visibility question and sits immediately before `tags`.
 Rows already stored before `prompt` was added stay blank until that date
 is pulled again. A `--through-latest` citations run re-pulls `START_DATE`

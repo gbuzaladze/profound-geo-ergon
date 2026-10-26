@@ -269,6 +269,10 @@ class CitationExportTests(unittest.TestCase):
             FIELDNAMES[FIELDNAMES.index("prompt") : FIELDNAMES.index("tags") + 1],
             ["prompt", "tags"],
         )
+        self.assertEqual(
+            FIELDNAMES[FIELDNAMES.index("country") : FIELDNAMES.index("region") + 1],
+            ["country", "region"],
+        )
 
     def test_citation_row_includes_url_author(self) -> None:
         row = citation_row(
@@ -282,10 +286,12 @@ class CitationExportTests(unittest.TestCase):
             path="/r/breastcancer/comments/abc/",
             tags="oncology",
             prompt="What is Ergon used for?",
-            region="United States",
+            country="United States",
         )
         self.assertEqual(row["author"], "r/breastcancer")
         self.assertEqual(row["prompt"], "What is Ergon used for?")
+        self.assertEqual(row["country"], "United States")
+        self.assertEqual(row["region"], "Americas")
 
     def test_flatten_answer_copies_prompt_onto_each_citation(self) -> None:
         class _Answer:
@@ -321,6 +327,8 @@ class CitationExportTests(unittest.TestCase):
             ["What is Ergon used for?", "What is Ergon used for?"],
         )
         self.assertEqual(rows[0]["tags"], "fluids|hcp")
+        self.assertEqual(rows[0]["country"], "United States")
+        self.assertEqual(rows[0]["region"], "Americas")
 
     def test_through_latest_stops_at_stored_date(self) -> None:
         self.assertEqual(
@@ -336,7 +344,7 @@ class CitationExportTests(unittest.TestCase):
         rows = [
             {
                 "date": "2026-10-12",
-                "region": "United States",
+                "country": "United States",
                 "topic": "Specialty fluids",
                 "platform": "ChatGPT",
                 "url": "https://www.instagram.com/p/AbCdEf123/",
@@ -344,7 +352,7 @@ class CitationExportTests(unittest.TestCase):
             },
             {
                 "date": "2026-10-12",
-                "region": "United States",
+                "country": "United States",
                 "topic": "Specialty fluids",
                 "platform": "ChatGPT",
                 "url": "https://www.reddit.com/r/breastcancer/comments/abc/",

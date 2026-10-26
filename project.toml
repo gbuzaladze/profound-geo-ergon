@@ -38,8 +38,8 @@ owned_citation_hosts = ["ergon.com"]
 # September 2026.
 start_date = "2026-09-01"
 
-# One Profound category per entry. Each category covers several countries;
-# the country is the region column on fact_scores_summarized, not the slug.
+# One Profound category per entry. Each category covers several countries.
+# Those names are the country column. [regions] assigns the region column.
 # slug is the data/ folder name. owned_asset falls back to [project] owned_asset.
 [[countries]]
 slug = "americas-uk-au-uae"
@@ -52,6 +52,29 @@ slug = "europe-asia"
 name = "Belgium, France, Germany, Spain, Sweden, Indonesia, Singapore, South Korea, Vietnam"
 category_id = "61d4fa1f-7d52-4edc-83d1-e5ae1f3b4265"
 owned_asset = "Ergon"
+
+# Screenshot grouping for the region column. Each name is a country value
+# Profound stores. Abbreviations are aliases of the same country.
+[regions]
+APAC = [
+  "South Korea",
+  "Singapore",
+  "Indonesia",
+  "Australia",
+  "United Arab Emirates",
+  "UAE",
+  "Vietnam",
+]
+Americas = ["United States", "US", "USA", "Mexico", "Brazil"]
+Europe = [
+  "Germany",
+  "France",
+  "Belgium",
+  "Spain",
+  "Sweden",
+  "United Kingdom",
+  "UK",
+]
 
 [ranking]
 # Number of brands kept per metric in each topic. The export unions top_n by
