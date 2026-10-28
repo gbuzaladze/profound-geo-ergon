@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections.abc import Mapping
 from time import perf_counter
 
 import profound
@@ -60,7 +61,6 @@ FIELDNAMES = [
     "topic",
     "platform",
     "asset",
-    "is_owned",
     "visibility",
     "share_of_voice",
     "average_position",
@@ -85,7 +85,6 @@ def flatten_record(record: object) -> dict[str, object]:
         # Profound calls the LLM "model"; the warehouse column is platform.
         "platform": ref_name(getattr(record, "model", None)),
         "asset": name,
-        "is_owned": bool(getattr(asset, "owned", False)) or is_owned_name(name),
         "visibility": getattr(record, "visibility_score", None),
         "share_of_voice": getattr(record, "share_of_voice", None),
         "average_position": getattr(record, "average_position", None),
@@ -114,55 +113,95 @@ def include_asset(
     return True
 
 
+def mentioned_alias_visibility(
+    client: Profound,
+    names: list[str],
+    *,
+    scan_end: str,
+) -> dict[str, float]:
+    """Return each alias's visibility from START_DATE through scan_end.
+
+    A missing name or a score of 0 means this category has no mentions.
+    Profound also returns 0 for a name it does not know.
+    """
+    if not names:
+        return {}
+    found: dict[str, float] = {}
+    for start in range(0, len(names), PAGE_SIZE):
+        batch = names[start : start + PAGE_SIZE]
+        response = call_api(
+            client.reports.query_visibility,
+            category_id=category_id(),
+            start_date=START_DATE,
+            end_date=scan_end,
+            metrics=["visibility_score"],
+            scope="all",
+            assets={"op": "in", "value": batch},
+            limit=len(batch),
+        )
+        for record in response.data:
+            asset = getattr(record, "asset", None)
+            name = getattr(asset, "name", None)
+            if not isinstance(name, str) or not name.strip():
+                continue
+            score = getattr(record, "visibility_score", None)
+            found[name] = float(score or 0)
+    return found
+
+
 def ensure_owned_assets(
     names: list[str],
     owned_by_asset: dict[str, bool],
     category_assets: list[tuple[str, bool]],
+    mentioned: Mapping[str, float] | None = None,
 ) -> None:
-    """Include the country's owned asset, plus aliases Profound tracks here.
+    """Include the country brand, plus owned aliases that have any mentions.
 
     The country's `owned_asset` is always kept, even outside every top N.
-    An alias is added only when this category lists that exact asset, so a
-    generic name is not zero-filled beside the local brand.
+    An alias with visibility above zero is kept even outside the top N.
+    An alias with no mentions is left out, including a name Profound does
+    not know. A category-asset spelling is used when Profound has one.
     """
     by_key = {name.casefold(): name for name, _owned in category_assets}
     present = {name.casefold(): name for name in owned_by_asset}
+    mentioned_keys = {
+        name.casefold()
+        for name, score in (mentioned or {}).items()
+        if score > 0
+    }
     primary = owned_asset().casefold()
     for configured in owned_asset_names():
         folded = configured.casefold()
         tracked = by_key.get(folded)
-        if tracked is None and folded != primary:
-            print(
-                f"{configured} is not a tracked asset in this category; "
-                "not adding an empty owned series."
-            )
-            continue
         canonical = tracked if tracked is not None else configured
         existing = present.get(folded)
-        if existing is None:
-            names.append(canonical)
-            owned_by_asset[canonical] = True
-            present[folded] = canonical
+        if existing is not None:
+            owned_by_asset[existing] = True
+            continue
+        if folded != primary and folded not in mentioned_keys:
             print(
-                f"{canonical} outside every top {TOP_N}; "
-                f"including as asset #{len(names)} (owned)."
+                f"{configured} has no mentions in this category; "
+                "not adding an owned series."
             )
             continue
-        owned_by_asset[existing] = True
+        names.append(canonical)
+        owned_by_asset[canonical] = True
+        present[folded] = canonical
+        print(
+            f"{canonical} outside every top {TOP_N}; "
+            f"including as asset #{len(names)} (owned)."
+        )
 
 
 def zero_fill(
     rows: list[dict[str, object]],
     *,
     assets: list[str],
-    owned_by_asset: dict[str, bool],
 ) -> list[dict[str, object]]:
     """Ensure every selected asset has a row for each SCORE_DIMENSIONS slice.
 
     Missing visibility and share_of_voice are set to 0. average_position and
     positive_sentiment stay blank when the asset was not present.
-
-    Mutates owned_by_asset in place: an asset is owned if any series row says so.
     """
     existing: dict[tuple[str, ...], dict[str, object]] = {}
     slices: set[tuple[str, ...]] = set()
@@ -174,14 +213,6 @@ def zero_fill(
 
         existing[key] = row
         slices.add(key[:-1])
-        asset = key[-1]
-        if asset in owned_by_asset:
-            owned_by_asset[asset] = (
-                bool(row.get("is_owned"))
-                or owned_by_asset[asset]
-                or is_owned_name(asset)
-            )
-            row["is_owned"] = owned_by_asset[asset]
 
     filled: list[dict[str, object]] = []
     for slice_key in slices:
@@ -198,7 +229,6 @@ def zero_fill(
                     **context,
                     "region": region_for_country(context["country"]) or None,
                     "asset": asset,
-                    "is_owned": owned_by_asset.get(asset, False),
                     "visibility": 0.0,
                     "share_of_voice": 0.0,
                     "average_position": None,
@@ -312,18 +342,11 @@ def _sentiment_assets_from_scores() -> list[tuple[str, bool]]:
             if not name:
                 continue
             has_sentiment = str(row.get("positive_sentiment") or "").strip() != ""
-            owned = str(row.get("is_owned") or "").strip().casefold() in {
-                "true",
-                "1",
-                "yes",
-            } or is_owned_name(name)
+            owned = is_owned_name(name)
             if not has_sentiment and not owned:
                 continue
-            current = found.get(name.casefold())
-            if current is None:
+            if name.casefold() not in found:
                 found[name.casefold()] = (name, owned)
-            elif owned and not current[1]:
-                found[name.casefold()] = (current[0], True)
     primary = owned_asset()
     if primary.casefold() not in found:
         found[primary.casefold()] = (primary, True)
@@ -585,7 +608,18 @@ def select_assets(
         category_assets=category_assets,
     )
 
-    ensure_owned_assets(names, owned_by_asset, category_assets)
+    pending_aliases = [
+        name
+        for name in owned_asset_names()
+        if name.casefold() != owned_asset().casefold()
+        and name.casefold() not in {item.casefold() for item in names}
+    ]
+    mentioned = mentioned_alias_visibility(
+        client, pending_aliases, scan_end=scan_end
+    )
+    if pending_aliases:
+        api_calls += (len(pending_aliases) + PAGE_SIZE - 1) // PAGE_SIZE
+    ensure_owned_assets(names, owned_by_asset, category_assets, mentioned)
 
     if not names:
         raise SystemExit(
@@ -656,7 +690,7 @@ def export(
     scan_end = end_date()
 
     with profound_client() as client:
-        assets, owned_by_asset, sentiment_assets, rank_calls = select_assets(
+        assets, _, sentiment_assets, rank_calls = select_assets(
             client, scan_end=scan_end
         )
         rows, series_calls = fetch_summarized(client, assets=assets, scan_end=scan_end)
@@ -671,7 +705,7 @@ def export(
         raise SystemExit("No summarized score rows were returned.")
 
     before_fill = len(rows)
-    rows = zero_fill(rows, assets=assets, owned_by_asset=owned_by_asset)
+    rows = zero_fill(rows, assets=assets)
     print(f"Zero-filled missing asset rows: {before_fill} -> {len(rows)}")
     matched = attach_sentiment(rows, sentiment)
     print(f"Attached positive_sentiment on {matched} of {len(rows)} rows")

@@ -79,7 +79,6 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("topic", "NVARCHAR(200) NOT NULL"),
         ("platform", "NVARCHAR(200) NOT NULL"),
         ("asset", "NVARCHAR(200) NOT NULL"),
-        ("is_owned", "BIT NOT NULL"),
         ("visibility", "DECIMAL(38, 16) NOT NULL"),
         ("share_of_voice", "DECIMAL(38, 16) NOT NULL"),
         ("average_position", "DECIMAL(38, 16) NULL"),
@@ -569,13 +568,6 @@ def _ensure_primary_key(cursor, schema: str, table: str) -> None:
 # Value conversion
 
 
-def _as_bool(value: object) -> bool:
-    """Treat CSV `true`/`1`/`yes` (any case) as True; everything else False."""
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().casefold() in {"true", "1", "yes"}
-
-
 def _as_float(value: object) -> float | None:
     """Parse a numeric cell; blank CSV values become SQL NULL."""
     if value is None or value == "":
@@ -668,8 +660,6 @@ def convert_value(column: str, value: object, *, table: str) -> object:
     not_null = column in _NOT_NULL_COLUMNS[table]
     if column == LOAD_DATE_COLUMN:
         return _as_datetime(value) or load_now()
-    if column == "is_owned":
-        return _as_bool(value)
     if column in _FLOAT_COLUMNS:
         number = _as_float(value)
         if number is None and not_null:
@@ -740,9 +730,6 @@ def _merge_score_row(
 ) -> dict[str, Any]:
     """Union two case-variant score rows that share one SQL key."""
     merged = dict(current)
-    merged["is_owned"] = _as_bool(current.get("is_owned")) or _as_bool(
-        incoming.get("is_owned")
-    )
     merged["asset"] = _prefer_asset_name(
         str(current.get("asset") or ""), str(incoming.get("asset") or "")
     )

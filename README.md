@@ -29,8 +29,9 @@ Shared settings live under `[project]` in `project.toml` (`owned_asset`,
 `start_date`). Each market is a
 `[[countries]]` table with `slug`, `name`, and `category_id`. Set
 `owned_asset` on an entry when Profound uses a different brand name.
-`owned_aliases` are marked `is_owned` and pulled only
-when that category tracks the exact name. The entry's `owned_asset` is
+`owned_aliases` are included when that category has
+any visibility for the name, even outside the top N. A name with no mentions
+is left out. The entry's `owned_asset` is
 always pulled. The API key stays in `.env`. Azure SQL credentials stay there
 too; the pipeline writes CSVs under `data/{slug}/` and replaces the same
 tables in schema `{slug}` (`americas-uk-au-uae`, `europe-asia`).
@@ -40,7 +41,7 @@ tables in schema `{slug}` (`americas-uk-au-uae`, `europe-asia`).
 1. Copy this folder (or clone it).
 2. Edit `project.toml` — at minimum `owned_asset`, `start_date`, and one
    `[[countries]]` entry. Add `owned_aliases` for extra product names that
-   should be marked `is_owned` when that category tracks the exact name.
+   should be included when the category has any mentions.
    Add `owned_citation_hosts` for hostnames or domains whose citation
    `category` should be `Owned`. Add `owned_citation_contains` for text that
    should match any hostname or domain, such as `ergon` for
@@ -128,11 +129,11 @@ by average position (lower is better), and by positive sentiment, then unions
 those lists. Sentiment ranking uses tracked category brands (v2 sentiment is
 per-brand). Time series are pulled for the combined set from `START_DATE`
 through yesterday. The country's `owned_asset` is always included, even
-outside every top N. An `owned_aliases` name is included only when this
-category tracks that exact asset, and those names are marked `is_owned`
-even when Profound tracks them as separate unowned assets.
+outside every top N. An `owned_aliases` name is included when its visibility
+since `START_DATE` is above zero, even outside the top N.
+A name with no mentions is left out.
 
-Columns: `date`, `country`, `region`, `topic`, `platform`, `asset`, `is_owned`,
+Columns: `date`, `country`, `region`, `topic`, `platform`, `asset`,
 `visibility`, `share_of_voice`, `average_position`, `positive_sentiment`.
 `region` is APAC, Americas, or Europe from `[regions]` in `project.toml`.
 

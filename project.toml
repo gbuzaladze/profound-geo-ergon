@@ -13,9 +13,9 @@
 # ranks outside the top N. Must match the asset name in Profound.
 owned_asset = "Ergon"
 
-# Extra Profound asset names that must always appear in fact_scores_summarized,
-# even if they rank outside the top N. Marked is_owned. An alias is exported
-# only when that category tracks the exact name.
+# Extra product names. A name with any visibility since start_date is
+# included even outside the top N. A name with no mentions in that category
+# is left out. Do not list Ergon here; that name is owned_asset.
 owned_aliases = []
 
 # Hostnames or registrable domains whose citation category is forced to Owned.
