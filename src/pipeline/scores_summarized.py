@@ -61,6 +61,7 @@ FIELDNAMES = [
     "topic",
     "platform",
     "asset",
+    "is_owned",
     "visibility",
     "share_of_voice",
     "average_position",
@@ -85,6 +86,7 @@ def flatten_record(record: object) -> dict[str, object]:
         # Profound calls the LLM "model"; the warehouse column is platform.
         "platform": ref_name(getattr(record, "model", None)),
         "asset": name,
+        "is_owned": bool(getattr(asset, "owned", False)) or is_owned_name(name),
         "visibility": getattr(record, "visibility_score", None),
         "share_of_voice": getattr(record, "share_of_voice", None),
         "average_position": getattr(record, "average_position", None),
@@ -197,11 +199,13 @@ def zero_fill(
     rows: list[dict[str, object]],
     *,
     assets: list[str],
+    owned_by_asset: dict[str, bool],
 ) -> list[dict[str, object]]:
     """Ensure every selected asset has a row for each SCORE_DIMENSIONS slice.
 
     Missing visibility and share_of_voice are set to 0. average_position and
     positive_sentiment stay blank when the asset was not present.
+    Mutates owned_by_asset in place: an asset is owned if any series row says so.
     """
     existing: dict[tuple[str, ...], dict[str, object]] = {}
     slices: set[tuple[str, ...]] = set()
@@ -213,6 +217,14 @@ def zero_fill(
 
         existing[key] = row
         slices.add(key[:-1])
+        asset = key[-1]
+        if asset in owned_by_asset:
+            owned_by_asset[asset] = (
+                bool(row.get("is_owned"))
+                or owned_by_asset[asset]
+                or is_owned_name(asset)
+            )
+            row["is_owned"] = owned_by_asset[asset]
 
     filled: list[dict[str, object]] = []
     for slice_key in slices:
@@ -229,6 +241,7 @@ def zero_fill(
                     **context,
                     "region": region_for_country(context["country"]) or None,
                     "asset": asset,
+                    "is_owned": owned_by_asset.get(asset, False),
                     "visibility": 0.0,
                     "share_of_voice": 0.0,
                     "average_position": None,
@@ -342,7 +355,11 @@ def _sentiment_assets_from_scores() -> list[tuple[str, bool]]:
             if not name:
                 continue
             has_sentiment = str(row.get("positive_sentiment") or "").strip() != ""
-            owned = is_owned_name(name)
+            owned = str(row.get("is_owned") or "").strip().casefold() in {
+                "true",
+                "1",
+                "yes",
+            } or is_owned_name(name)
             if not has_sentiment and not owned:
                 continue
             if name.casefold() not in found:
@@ -690,7 +707,7 @@ def export(
     scan_end = end_date()
 
     with profound_client() as client:
-        assets, _, sentiment_assets, rank_calls = select_assets(
+        assets, owned_by_asset, sentiment_assets, rank_calls = select_assets(
             client, scan_end=scan_end
         )
         rows, series_calls = fetch_summarized(client, assets=assets, scan_end=scan_end)
@@ -705,7 +722,7 @@ def export(
         raise SystemExit("No summarized score rows were returned.")
 
     before_fill = len(rows)
-    rows = zero_fill(rows, assets=assets)
+    rows = zero_fill(rows, assets=assets, owned_by_asset=owned_by_asset)
     print(f"Zero-filled missing asset rows: {before_fill} -> {len(rows)}")
     matched = attach_sentiment(rows, sentiment)
     print(f"Attached positive_sentiment on {matched} of {len(rows)} rows")

@@ -28,7 +28,13 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from mssql_python import connect
 
-from pipeline.config import COUNTRY_REGION_PAIRS, active_country, project_root
+from pipeline.config import (
+    COUNTRIES,
+    COUNTRY_REGION_PAIRS,
+    OWNED_ALIASES,
+    active_country,
+    project_root,
+)
 
 # Bulk copy: 5k rows per TDS batch; 1 hour covers the large citation CSVs.
 _BULK_BATCH_SIZE = 5000
@@ -79,6 +85,7 @@ TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("topic", "NVARCHAR(200) NOT NULL"),
         ("platform", "NVARCHAR(200) NOT NULL"),
         ("asset", "NVARCHAR(200) NOT NULL"),
+        ("is_owned", "BIT NOT NULL"),
         ("visibility", "DECIMAL(38, 16) NOT NULL"),
         ("share_of_voice", "DECIMAL(38, 16) NOT NULL"),
         ("average_position", "DECIMAL(38, 16) NULL"),
@@ -293,8 +300,10 @@ def ensure_schema_and_tables(cursor, schema: str) -> None:
 
     Existing fact tables rename `region` to `country` and add `region` beside
     it. Tables whose column order differs from TABLES are copied into order.
-    A new `prompt` stays null until the next citation load. Narrow text
-    columns are widened in place, and `load_date` is added when absent.
+    A missing `is_owned` on scores is filled from configured owned names until
+    the next scores export. A new `prompt` stays null until the next citation
+    load. Narrow text columns are widened in place, and `load_date` is added
+    when absent.
     """
     # CREATE SCHEMA must be its own batch; run it only when the schema is new.
     cursor.execute("SELECT 1 FROM sys.schemas WHERE name = ?", (schema,))
@@ -518,12 +527,38 @@ def _ensure_country_and_region(cursor, schema: str, table: str) -> None:
         )
 
 
+def _is_owned_backfill_sql() -> str:
+    """BIT expression: 1 when asset matches a configured owned name.
+
+    Used only while copying a scores table that does not yet have `is_owned`.
+    The next scores export replaces these values with the Profound flag.
+    """
+    seen: set[str] = set()
+    literals: list[str] = []
+    for country in COUNTRIES:
+        for name in (country.owned_asset, *OWNED_ALIASES):
+            folded = name.casefold()
+            if not folded or folded in seen:
+                continue
+            seen.add(folded)
+            literals.append("N'" + name.replace("'", "''") + "'")
+    if not literals:
+        return "CAST(0 AS BIT)"
+    joined = ", ".join(literals)
+    return (
+        "CASE WHEN LTRIM(RTRIM([asset])) IN ("
+        + joined
+        + ") THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END"
+    )
+
+
 def _ensure_column_order(cursor, schema: str, table: str) -> None:
     """Rebuild a table when its columns are not in TABLES order.
 
     SQL Server appends new columns, so `region` would land after `load_date`
     unless the table is copied. Rows keep values for columns that already
-    exist. A missing column, such as `prompt` on older citations, stays null.
+    exist. A missing `is_owned` is filled from configured owned names. A
+    missing nullable column, such as `prompt` on older citations, stays null.
     """
     desired = _columns(table)
     actual = _table_column_names(cursor, schema, table)
@@ -532,12 +567,21 @@ def _ensure_column_order(cursor, schema: str, table: str) -> None:
     print(f"  [{schema}].[{table}]: rebuilding column order", flush=True)
     staging, qualified_stage = _stage_reordered_table(cursor, schema, table)
     present = {name.casefold() for name in actual}
-    shared = [name for name in desired if name.casefold() in present]
-    if shared:
-        cols = ", ".join(f"[{name}]" for name in shared)
+    insert_names: list[str] = []
+    select_parts: list[str] = []
+    for name in desired:
+        if name.casefold() in present:
+            insert_names.append(name)
+            select_parts.append(f"[{name}]")
+        elif name == "is_owned":
+            insert_names.append(name)
+            select_parts.append(_is_owned_backfill_sql())
+    if insert_names:
+        cols = ", ".join(f"[{name}]" for name in insert_names)
+        selected = ", ".join(select_parts)
         cursor.execute(
             f"INSERT INTO {qualified_stage} ({cols}) "
-            f"SELECT {cols} FROM {_qualified(schema, table)}"
+            f"SELECT {selected} FROM {_qualified(schema, table)}"
         )
     _swap_reordered_table(cursor, schema, table, staging)
 
@@ -566,6 +610,13 @@ def _ensure_primary_key(cursor, schema: str, table: str) -> None:
 
 
 # Value conversion
+
+
+def _as_bool(value: object) -> bool:
+    """Treat CSV `true`/`1`/`yes` (any case) as True; everything else False."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"true", "1", "yes"}
 
 
 def _as_float(value: object) -> float | None:
@@ -660,6 +711,8 @@ def convert_value(column: str, value: object, *, table: str) -> object:
     not_null = column in _NOT_NULL_COLUMNS[table]
     if column == LOAD_DATE_COLUMN:
         return _as_datetime(value) or load_now()
+    if column == "is_owned":
+        return _as_bool(value)
     if column in _FLOAT_COLUMNS:
         number = _as_float(value)
         if number is None and not_null:
@@ -730,6 +783,9 @@ def _merge_score_row(
 ) -> dict[str, Any]:
     """Union two case-variant score rows that share one SQL key."""
     merged = dict(current)
+    merged["is_owned"] = _as_bool(current.get("is_owned")) or _as_bool(
+        incoming.get("is_owned")
+    )
     merged["asset"] = _prefer_asset_name(
         str(current.get("asset") or ""), str(incoming.get("asset") or "")
     )

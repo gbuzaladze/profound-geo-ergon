@@ -30,7 +30,8 @@ Shared settings live under `[project]` in `project.toml` (`owned_asset`,
 `[[countries]]` table with `slug`, `name`, and `category_id`. Set
 `owned_asset` on an entry when Profound uses a different brand name.
 `owned_aliases` are included when that category has
-any visibility for the name, even outside the top N. A name with no mentions
+any visibility for the name, even outside the top N, and those rows are marked
+`is_owned`. A name with no mentions
 is left out. The entry's `owned_asset` is
 always pulled. The API key stays in `.env`. Azure SQL credentials stay there
 too; the pipeline writes CSVs under `data/{slug}/` and replaces the same
@@ -41,7 +42,8 @@ tables in schema `{slug}` (`americas-uk-au-uae`, `europe-asia`).
 1. Copy this folder (or clone it).
 2. Edit `project.toml` — at minimum `owned_asset`, `start_date`, and one
    `[[countries]]` entry. Add `owned_aliases` for extra product names that
-   should be included when the category has any mentions.
+   should be included when the category has any mentions. Those names are marked
+   `is_owned`.
    Add `owned_citation_hosts` for hostnames or domains whose citation
    `category` should be `Owned`. Add `owned_citation_contains` for text that
    should match any hostname or domain, such as `ergon` for
@@ -133,8 +135,10 @@ outside every top N. An `owned_aliases` name is included when its visibility
 since `START_DATE` is above zero, even outside the top N.
 A name with no mentions is left out.
 
-Columns: `date`, `country`, `region`, `topic`, `platform`, `asset`,
+Columns: `date`, `country`, `region`, `topic`, `platform`, `asset`, `is_owned`,
 `visibility`, `share_of_voice`, `average_position`, `positive_sentiment`.
+`is_owned` is true for the entry's `owned_asset`, each included
+`owned_aliases` name, and any brand Profound marks as owned.
 `region` is APAC, Americas, or Europe from `[regions]` in `project.toml`.
 
 After the pull, every selected asset is zero-filled for every observed
